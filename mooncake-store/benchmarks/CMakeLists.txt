@@ -39,3 +39,12 @@ if(USE_NOF)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
                                                        gflags::gflags)
 endif()
+
+# Add batchload benchmark executable
+# Tests single-node BatchLoad (read) performance for the SSD-offload layer
+# against bucket and file-per-key backends, with TB-scale streaming prefill
+# (BatchOffload) as untimed setup and configurable read thread counts.
+add_executable(batchload_bench batchload_bench.cpp)
+target_link_libraries(
+  batchload_bench PRIVATE mooncake_store cachelib_memory_allocator
+                         gflags::gflags glog::glog pthread)
