@@ -68,6 +68,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <latch>
@@ -77,6 +78,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -162,6 +164,17 @@ DEFINE_bool(verify, true,
             "true)");
 DEFINE_bool(fail_fast, true,
             "Exit immediately on first checksum mismatch (default: true)");
+
+// === Cache control ===
+// Prefill writes 20TB; right after, that data is hot in the Linux page cache,
+// so reads return from RAM and throughput can exceed the SSD's physical
+// bandwidth. Dropping the page cache between prefill and the read test forces
+// cold random reads from the SSD (requires root: writes 3 to
+// /proc/sys/vm/drop_caches). Has no effect in reuse mode (prefill skipped).
+DEFINE_bool(drop_cache, true,
+            "Drop the Linux page cache after prefill so the read test measures "
+            "cold SSD random reads instead of warm-cache RAM reads. Requires "
+            "root. Only effective when prefill_size_tb > 0 (default: true).");
 
 // === Cleanup ===
 DEFINE_bool(skip_cleanup, true,
@@ -733,6 +746,34 @@ void CleanupStoragePath(const std::string& path) {
     fs::create_directories(path);
 }
 
+// Drop the Linux page cache so subsequent reads come cold from the SSD.
+// Requires root: writes "3" to /proc/sys/vm/drop_caches (1=pagecache,
+// 2=dentries/inodes, 3=both). Must sync() first so dirty pages are flushed to
+// disk before being dropped. Returns true on success, false (with a warning)
+// if not root — in that case the read test will measure warm-cache throughput.
+bool DropPageCache() {
+    // Flush all dirty pages to disk first; otherwise drop_caches skips them.
+    sync();
+
+    const char* kPath = "/proc/sys/vm/drop_caches";
+    std::ofstream f(kPath);
+    if (!f.is_open()) {
+        LOG(WARNING) << "Cannot open " << kPath
+                     << " (need root). Page cache NOT dropped; read test will "
+                        "measure warm-cache throughput.";
+        return false;
+    }
+    f << "3";
+    f.close();
+    if (f.fail()) {
+        LOG(WARNING) << "Failed to write to " << kPath
+                     << " (need root). Page cache NOT dropped.";
+        return false;
+    }
+    std::cout << "  Page cache dropped (cold SSD reads ahead).\n";
+    return true;
+}
+
 void PrintBanner(BackendMode mode, size_t value_size, size_t batch_size,
                  const std::vector<size_t>& thread_counts, size_t prefill_tb,
                  size_t dataset_tb, size_t total_keys) {
@@ -760,6 +801,10 @@ void PrintBanner(BackendMode mode, size_t value_size, size_t batch_size,
               << "\n";
     std::cout << "Dataset size:     " << dataset_tb << " TB (" << total_keys
               << " keys)\n";
+    std::cout << "Drop page cache:  " << (FLAGS_drop_cache ? "yes" : "no")
+              << " (cold SSD reads"
+              << (FLAGS_drop_cache ? "" : " / warm-cache")
+              << ")\n";
     std::cout << "-----------------------------------------------------\n";
 }
 
@@ -889,6 +934,17 @@ int main(int argc, char** argv) {
         std::cout << "\n[Phase 1: Prefill (untimed)]\n";
         PrefillPhase(backend.get(), total_keys, value_size, batch_size,
                      FLAGS_prefill_threads);
+
+        // Prefill just wrote the whole dataset; it is now hot in the page
+        // cache. Drop it so the read test measures cold SSD random reads
+        // (otherwise throughput reflects RAM bandwidth, not the SSD).
+        if (FLAGS_drop_cache) {
+            std::cout << "\n  Dropping page cache before read test...\n";
+            DropPageCache();
+        } else {
+            std::cout << "\n  drop_cache=false; read test will measure "
+                         "warm-cache throughput.\n";
+        }
     } else {
         std::cout << "\n[Phase 1: Prefill skipped (prefill_size_tb=0, "
                      "reusing existing data)]\n";
