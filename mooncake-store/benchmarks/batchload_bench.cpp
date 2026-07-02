@@ -166,15 +166,18 @@ DEFINE_bool(fail_fast, true,
             "Exit immediately on first checksum mismatch (default: true)");
 
 // === Cache control ===
-// Prefill writes 20TB; right after, that data is hot in the Linux page cache,
-// so reads return from RAM and throughput can exceed the SSD's physical
-// bandwidth. Dropping the page cache between prefill and the read test forces
-// cold random reads from the SSD (requires root: writes 3 to
-// /proc/sys/vm/drop_caches). Has no effect in reuse mode (prefill skipped).
+// Without intervention, reads warm the page cache: the first thread count run
+// pulls data into RAM, and every later run in the sweep reads partly from RAM
+// instead of the SSD, biasing throughput upward for later runs. drop_cache
+// flushes + drops the page cache before EACH thread count so every run is a
+// cold SSD random read (requires root: sync() then write 3 to
+// /proc/sys/vm/drop_caches). Backend metadata is in process memory, so this
+// is safe and needs no re-ScanMeta.
 DEFINE_bool(drop_cache, true,
-            "Drop the Linux page cache after prefill so the read test measures "
-            "cold SSD random reads instead of warm-cache RAM reads. Requires "
-            "root. Only effective when prefill_size_tb > 0 (default: true).");
+            "Drop the Linux page cache before EACH thread count so every run "
+            "measures cold SSD random reads instead of warm-cache RAM reads. "
+            "Requires root. Effective for all runs in the sweep (default: "
+            "true).");
 
 // === Cleanup ===
 DEFINE_bool(skip_cleanup, true,
@@ -934,17 +937,6 @@ int main(int argc, char** argv) {
         std::cout << "\n[Phase 1: Prefill (untimed)]\n";
         PrefillPhase(backend.get(), total_keys, value_size, batch_size,
                      FLAGS_prefill_threads);
-
-        // Prefill just wrote the whole dataset; it is now hot in the page
-        // cache. Drop it so the read test measures cold SSD random reads
-        // (otherwise throughput reflects RAM bandwidth, not the SSD).
-        if (FLAGS_drop_cache) {
-            std::cout << "\n  Dropping page cache before read test...\n";
-            DropPageCache();
-        } else {
-            std::cout << "\n  drop_cache=false; read test will measure "
-                         "warm-cache throughput.\n";
-        }
     } else {
         std::cout << "\n[Phase 1: Prefill skipped (prefill_size_tb=0, "
                      "reusing existing data)]\n";
@@ -959,6 +951,16 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < thread_counts.size(); ++i) {
         size_t num_threads = thread_counts[i];
         std::cout << "\n--- Read test: " << num_threads << " thread(s) ---\n";
+
+        // Drop the page cache before EACH thread count so every run measures
+        // cold SSD random reads. Without this, earlier runs (smaller thread
+        // counts) warm the cache and later runs read from RAM instead of the
+        // SSD, biasing throughput upward. Backend metadata lives in process
+        // memory, not page cache, so dropping is safe and needs no re-ScanMeta.
+        if (FLAGS_drop_cache) {
+            DropPageCache();
+        }
+
         BenchmarkStats stats;
         ReadPhase(backend.get(), total_keys, value_size, batch_size,
                   num_threads, num_operations, warmup_operations, stats);
