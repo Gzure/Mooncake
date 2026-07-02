@@ -22,7 +22,7 @@
  * file-per-key backend (one file per key). The write path (BatchOffload) is
  * only used to stream-prefill TB-scale data onto SSD as setup and is NOT timed.
  *
- * WORKFLOW (two phases, single backend + single thread count per run):
+ * WORKFLOW (single backend, one init + prefill, then a thread-count sweep):
  *
  *   Phase 1 - Prefill (setup, untimed):
  *     When --prefill_size_tb > 0, N threads concurrently BatchOffload
@@ -32,9 +32,13 @@
  *     on-disk dataset is reused for the read test.
  *
  *   Phase 2 - Read (measured):
- *     --num_threads threads each perform --num_operations random BatchLoad
- *     calls (batch_size keys per call) drawn from the prefilled key space.
- *     Only the BatchLoad call itself is timed. Verification is optional.
+ *     The backend (and its in-memory metadata, incl. ScanMeta over the full
+ *     dataset for keyper_key) is initialized ONCE, then the read test runs
+ *     once per thread count in --num_threads (default 1,2,4,8,16,32). Each
+ *     run performs --num_operations random BatchLoad calls per thread
+ *     (batch_size keys per call) and prints its own report. Only the BatchLoad
+ *     call itself is timed. Verification is optional. Doing the sweep inside
+ *     one process avoids re-scanning 20TB of metadata between thread counts.
  *
  * METRICS:
  *   - Throughput (GB/s, primary): total bytes read / wall-clock seconds
@@ -42,12 +46,13 @@
  *
  * REUSE PATTERN (same TB dataset across multiple read configs):
  *
- *   # First run: prefill 1TB (slow, once)
- *   ./batchload_bench --backend=bucket --prefill_size_tb=1 --num_threads=1
+ *   # First run: prefill 20TB (slow, once)
+ *   ./batchload_bench --backend=bucket --prefill_size_tb=20 \
+ *                     --total_size_limit_bytes=25000000000000
  *
- *   # Later runs: reuse SSD data, vary thread count (fast)
+ *   # Later runs: reuse SSD data, sweep thread counts (fast, one process)
  *   ./batchload_bench --backend=bucket --prefill_size_tb=0 \
- *                     --dataset_size_tb=1 --num_threads=8
+ *                     --dataset_size_tb=20 --num_threads=1,2,4,8,16,32
  *
  * NOTE: This benchmark is Linux-oriented (posix_memalign, unistd.h), matching
  * the existing storage_backend_bench.cpp, since the SSD-offload layer targets
@@ -69,6 +74,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -98,9 +104,20 @@ DEFINE_uint64(value_size, 4 * 1024 * 1024,
               "Value size in bytes per key (default: 4MB)");
 DEFINE_uint64(batch_size, 32,
               "Number of keys per BatchLoad / BatchOffload call (default: 32)");
-DEFINE_uint64(capacity_gb, 2048,
-              "Backend storage capacity limit in GB (default: 2048 = 2TB). "
-              "Must be >= prefill/dataset size.");
+
+// === Backend capacity limits (must cover the prefilled dataset) ===
+// These map directly to FileStorageConfig.total_keys_limit / total_size_limit,
+// which BucketStorageBackend::IsEnableOffloading() checks before every
+// BatchOffload. If total_size_limit is too small, offload aborts at the limit
+// with KEYS_ULTRA_LIMIT (-1203). Defaults are intentionally large for TB-scale
+// prefill.
+DEFINE_uint64(total_keys_limit, 20'000'000,
+              "Max number of keys the backend will accept (default: 20M). "
+              "Must be >= prefill_keys = prefill_size_tb*TB/value_size.");
+DEFINE_uint64(total_size_limit_bytes, 25ULL * 1024 * 1024 * 1024 * 1024,
+              "Max total bytes the backend will accept (default: 25 TiB). "
+              "Must be > prefill_size_tb*TB. If you see error -1203 "
+              "(KEYS_ULTRA_LIMIT) during prefill, raise this.");
 
 // === Bucket-specific (only effective when backend=bucket) ===
 DEFINE_uint64(bucket_keys_limit, 500,
@@ -127,12 +144,17 @@ DEFINE_uint64(dataset_size_tb, 1,
               "match the amount originally prefilled.");
 
 // === Read test (the measured workload) ===
-DEFINE_uint64(num_threads, 1,
-              "Number of concurrent BatchLoad reader threads (default: 1)");
+// Accepts a single value ("8") or a comma-separated list ("1,2,4,8,16,32").
+// When a list is given, the backend is initialized and prefilled ONCE, then
+// the read test runs once per thread count, each producing its own report.
+// This avoids re-scanning 20TB of metadata between thread sweeps.
+DEFINE_string(num_threads, "1,2,4,8,16,32",
+              "Concurrent BatchLoad reader thread count(s). Single value or "
+              "comma-separated list (default: 1,2,4,8,16,32).");
 DEFINE_uint64(num_operations, 1000,
               "Number of BatchLoad operations per thread (default: 1000)");
-DEFINE_uint64(warmup_operations, 50,
-              "Number of untimed warmup operations per thread (default: 50)");
+DEFINE_uint64(warmup_operations, 100,
+              "Number of untimed warmup operations per thread (default: 100)");
 
 // === Verification ===
 DEFINE_bool(verify, true,
@@ -420,11 +442,13 @@ std::string BackendModeToString(BackendMode m) {
 }
 
 std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
-    BackendMode mode, const std::string& storage_path, size_t capacity_bytes) {
+    BackendMode mode, const std::string& storage_path) {
     mooncake::FileStorageConfig config;
     config.storage_filepath = storage_path;
-    config.total_size_limit = capacity_bytes;
-    config.total_keys_limit = 10'000'000;
+    config.total_size_limit =
+        static_cast<int64_t>(FLAGS_total_size_limit_bytes);
+    config.total_keys_limit =
+        static_cast<int64_t>(FLAGS_total_keys_limit);
 
     switch (mode) {
         case BackendMode::BUCKET: {
@@ -710,18 +734,26 @@ void CleanupStoragePath(const std::string& path) {
 }
 
 void PrintBanner(BackendMode mode, size_t value_size, size_t batch_size,
-                 size_t num_threads, size_t prefill_tb, size_t dataset_tb,
-                 size_t total_keys) {
+                 const std::vector<size_t>& thread_counts, size_t prefill_tb,
+                 size_t dataset_tb, size_t total_keys) {
     std::cout << "\n================ BatchLoad Benchmark ================\n";
     std::cout << "Backend:          " << BackendModeToString(mode) << "\n";
     std::cout << "Value size:       " << (value_size / MB) << " MB\n";
     std::cout << "Batch size:       " << batch_size << " keys/op\n";
-    std::cout << "Read threads:     " << num_threads << "\n";
+    std::cout << "Read threads:     ";
+    for (size_t i = 0; i < thread_counts.size(); ++i) {
+        if (i) std::cout << ",";
+        std::cout << thread_counts[i];
+    }
+    std::cout << " (swept in one process)\n";
     if (mode == BackendMode::BUCKET) {
         std::cout << "Bucket keys limit: " << FLAGS_bucket_keys_limit << "\n";
     }
     std::cout << "Storage path:     " << FLAGS_storage_path << "\n";
-    std::cout << "Capacity:         " << FLAGS_capacity_gb << " GB\n";
+    std::cout << "Total keys limit: " << FLAGS_total_keys_limit << "\n";
+    std::cout << "Total size limit: " << std::fixed << std::setprecision(2)
+              << (static_cast<double>(FLAGS_total_size_limit_bytes) / TB)
+              << " TiB\n";
     std::cout << "Prefill size:     "
               << (prefill_tb > 0 ? std::to_string(prefill_tb) + " TB"
                                  : std::string("0 (reuse existing)"))
@@ -729,6 +761,34 @@ void PrintBanner(BackendMode mode, size_t value_size, size_t batch_size,
     std::cout << "Dataset size:     " << dataset_tb << " TB (" << total_keys
               << " keys)\n";
     std::cout << "-----------------------------------------------------\n";
+}
+
+// Parse a comma-separated thread-count spec ("1,2,4,8,16,32") into a sorted,
+// de-duplicated list. Falls back to a single value ("8").
+std::vector<size_t> ParseThreadCounts(const std::string& spec) {
+    std::vector<size_t> counts;
+    std::string token;
+    std::stringstream ss(spec);
+    while (std::getline(ss, token, ',')) {
+        // trim whitespace
+        size_t a = token.find_first_not_of(" \t");
+        size_t b = token.find_last_not_of(" \t");
+        if (a == std::string::npos) continue;
+        token = token.substr(a, b - a + 1);
+        if (token.empty()) continue;
+        try {
+            size_t v = std::stoul(token);
+            if (v > 0) counts.push_back(v);
+        } catch (...) {
+            LOG(FATAL) << "Invalid thread count in --num_threads: " << token;
+        }
+    }
+    if (counts.empty()) {
+        LOG(FATAL) << "--num_threads produced no valid counts: " << spec;
+    }
+    std::sort(counts.begin(), counts.end());
+    counts.erase(std::unique(counts.begin(), counts.end()), counts.end());
+    return counts;
 }
 
 // ============================================================================
@@ -743,10 +803,9 @@ int main(int argc, char** argv) {
     BackendMode mode = ParseBackendMode(FLAGS_backend);
     size_t value_size = FLAGS_value_size;
     size_t batch_size = FLAGS_batch_size;
-    size_t num_threads = FLAGS_num_threads;
     size_t num_operations = FLAGS_num_operations;
     size_t warmup_operations = FLAGS_warmup_operations;
-    size_t capacity_bytes = FLAGS_capacity_gb * GB;
+    std::vector<size_t> thread_counts = ParseThreadCounts(FLAGS_num_threads);
 
     // Determine the active TB amount and key count.
     // Prefill mode (prefill_size_tb > 0): total_keys derived from prefill size.
@@ -766,12 +825,23 @@ int main(int argc, char** argv) {
     if (batch_size == 0) {
         LOG(FATAL) << "--batch_size must be > 0";
     }
-    if (num_threads == 0) {
-        LOG(FATAL) << "--num_threads must be > 0";
+
+    // Sanity: capacity limits must cover the dataset, otherwise prefill hits
+    // KEYS_ULTRA_LIMIT (-1203) partway through.
+    if (static_cast<size_t>(FLAGS_total_keys_limit) < total_keys) {
+        LOG(WARNING) << "--total_keys_limit (" << FLAGS_total_keys_limit
+                     << ") < total_keys (" << total_keys
+                     << "); prefill will likely fail with -1203.";
+    }
+    if (FLAGS_total_size_limit_bytes < active_tb * TB) {
+        LOG(WARNING) << "--total_size_limit_bytes ("
+                     << FLAGS_total_size_limit_bytes << ") < dataset ("
+                     << active_tb * TB
+                     << " bytes); prefill will likely fail with -1203.";
     }
 
-    PrintBanner(mode, value_size, batch_size, num_threads, prefill_tb, active_tb,
-                total_keys);
+    PrintBanner(mode, value_size, batch_size, thread_counts, prefill_tb,
+                active_tb, total_keys);
 
     // Wipe storage only when entering prefill mode; in reuse mode the existing
     // on-disk data must be preserved.
@@ -781,12 +851,12 @@ int main(int argc, char** argv) {
         fs::create_directories(FLAGS_storage_path);
     }
 
-    auto backend = CreateBackend(mode, FLAGS_storage_path, capacity_bytes);
+    // ---- Build + Init backend ONCE (ScanMeta over 20TB is slow) ----
+    auto backend = CreateBackend(mode, FLAGS_storage_path);
     if (!backend) {
         LOG(FATAL) << "Failed to create backend";
     }
 
-    // ---- Init ----
     auto init_start = std::chrono::steady_clock::now();
     auto init_result = backend->Init();
     if (!init_result) {
@@ -799,7 +869,7 @@ int main(int argc, char** argv) {
               << init_sec << " s\n";
 
     // FilePerKey must scan on-disk metadata before reads work. In reuse mode
-    // this rebuilds total_keys/total_size from existing files.
+    // this rebuilds total_keys/total_size from existing files. Done once.
     if (mode == BackendMode::KEY_PER_KEY) {
         auto scan_start = std::chrono::steady_clock::now();
         backend->ScanMeta(
@@ -814,7 +884,7 @@ int main(int argc, char** argv) {
                   << scan_sec << " s (required for keyper_key)\n";
     }
 
-    // ---- Phase 1: Prefill (setup, untimed) ----
+    // ---- Phase 1: Prefill (setup, untimed) — ONCE ----
     if (prefill_tb > 0) {
         std::cout << "\n[Phase 1: Prefill (untimed)]\n";
         PrefillPhase(backend.get(), total_keys, value_size, batch_size,
@@ -824,12 +894,20 @@ int main(int argc, char** argv) {
                      "reusing existing data)]\n";
     }
 
-    // ---- Phase 2: Read test (measured) ----
-    std::cout << "\n[Phase 2: Read test (measured)]\n";
-    BenchmarkStats stats;
-    ReadPhase(backend.get(), total_keys, value_size, batch_size, num_threads,
-              num_operations, warmup_operations, stats);
-    stats.PrintStatistics();
+    // ---- Phase 2: Read test (measured) — sweep thread counts ----
+    // The backend (and its in-memory metadata / ScanMeta result) is reused
+    // across all thread counts so we pay the 20TB scan cost only once.
+    std::cout << "\n[Phase 2: Read test (measured) — sweeping "
+              << thread_counts.size() << " thread count(s)]\n";
+
+    for (size_t i = 0; i < thread_counts.size(); ++i) {
+        size_t num_threads = thread_counts[i];
+        std::cout << "\n--- Read test: " << num_threads << " thread(s) ---\n";
+        BenchmarkStats stats;
+        ReadPhase(backend.get(), total_keys, value_size, batch_size,
+                  num_threads, num_operations, warmup_operations, stats);
+        stats.PrintStatistics();
+    }
 
     // ---- Cleanup ----
     if (!FLAGS_skip_cleanup) {
