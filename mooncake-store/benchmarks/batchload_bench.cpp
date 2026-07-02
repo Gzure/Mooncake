@@ -602,7 +602,7 @@ void PrefillPhase(mooncake::StorageBackendInterface* backend,
 void ReadPhase(mooncake::StorageBackendInterface* backend, size_t total_keys,
                size_t value_size, size_t batch_size, size_t num_threads,
                size_t num_operations, size_t warmup_operations,
-               BenchmarkStats& stats) {
+               size_t round_index, BenchmarkStats& stats) {
     if (total_keys == 0) {
         LOG(FATAL) << "Cannot run read test with 0 keys in dataset.";
     }
@@ -613,6 +613,8 @@ void ReadPhase(mooncake::StorageBackendInterface* backend, size_t total_keys,
     std::cout << "  Warmup: " << warmup_operations << " ops/thread (untimed)\n";
     std::cout << "  Verification: " << (FLAGS_verify ? "enabled" : "disabled")
               << "\n";
+    std::cout << "  Round " << round_index << ": per-thread disjoint key shard"
+              << ", round-offset RNG seeds\n";
 
     stats.Clear();
     stats.InitThreads(num_threads, num_operations);
@@ -620,6 +622,14 @@ void ReadPhase(mooncake::StorageBackendInterface* backend, size_t total_keys,
     std::latch start_latch(num_threads + 1);
     std::latch end_latch(num_threads);
     std::atomic<size_t> checksum_failures{0};
+
+    // Partition the key space into disjoint per-thread shards so threads within
+    // a round read mostly non-overlapping keys. Remainder keys go to the last
+    // shard. Each thread samples randomly inside its own shard. If threads
+    // outnumber keys (only possible for tiny datasets), fall back to sharing
+    // the whole space to avoid empty shards / division-by-zero.
+    bool shard = (num_threads <= total_keys);
+    size_t keys_per_thread = shard ? (total_keys / num_threads) : 0;
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
@@ -630,7 +640,21 @@ void ReadPhase(mooncake::StorageBackendInterface* backend, size_t total_keys,
             BufferPool pool;
             pool.Init(batch_size, value_size);
 
-            std::mt19937_64 rng(42 + t);  // distinct seed per thread
+            // Per-thread disjoint key shard (or whole space if not sharding).
+            // Last thread takes the remainder when sharding.
+            size_t shard_start = shard ? (t * keys_per_thread) : 0;
+            size_t shard_end =
+                (shard && t == num_threads - 1)
+                    ? total_keys
+                    : (shard ? shard_start + keys_per_thread : total_keys);
+            size_t shard_size = shard_end - shard_start;
+
+            // Seed incorporates round_index so different rounds sample from
+            // different parts of the (same) shard, reducing cross-round key
+            // overlap and thus cross-round cache warming.
+            std::mt19937_64 rng(
+                0x9E3779B97F4A7C15ULL * (round_index + 1) +
+                0x6A09E667F3BCC908ULL * (t + 1));
 
             ThreadStats& my_stats = stats.GetThreadStats(t);
 
@@ -651,14 +675,18 @@ void ReadPhase(mooncake::StorageBackendInterface* backend, size_t total_keys,
             for (size_t op = 0; op < total_ops; ++op) {
                 bool is_warmup = (op < warmup_operations);
 
-                // Sample batch_size DISTINCT keys (within this batch) from the
-                // global key space. Cross-batch/cross-op repetition is allowed
-                // and expected (random access).
+                // Sample batch_size DISTINCT keys from THIS THREAD'S shard.
+                // Within a batch keys are distinct (BatchLoad takes a map);
+                // across batches/ops keys may repeat (random access). Keys are
+                // translated back to global indices via shard_start so they
+                // match prefilled KeyOf(global_index).
                 seen.clear();
                 load_batch.clear();
                 sampled_keys.clear();
                 while (sampled_keys.size() < batch_size) {
-                    size_t k = static_cast<size_t>(rng()) % total_keys;
+                    size_t local_k =
+                        static_cast<size_t>(rng()) % shard_size;
+                    size_t k = shard_start + local_k;
                     if (seen.insert(k).second) {
                         size_t slot = sampled_keys.size();
                         sampled_keys.push_back(k);
@@ -963,7 +991,7 @@ int main(int argc, char** argv) {
 
         BenchmarkStats stats;
         ReadPhase(backend.get(), total_keys, value_size, batch_size,
-                  num_threads, num_operations, warmup_operations, stats);
+                  num_threads, num_operations, warmup_operations, i, stats);
         stats.PrintStatistics();
     }
 
