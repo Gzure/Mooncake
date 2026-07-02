@@ -121,6 +121,19 @@ DEFINE_uint64(total_size_limit_bytes, 25ULL * 1024 * 1024 * 1024 * 1024,
               "Must be > prefill_size_tb*TB. If you see error -1203 "
               "(KEYS_ULTRA_LIMIT) during prefill, raise this.");
 
+// === io_uring ===
+// Without io_uring, BatchLoad falls back to synchronous pread: one 4MB read at
+// a time per thread, so NVMe queue depth stays ~1 and throughput is capped far
+// below the SSD's bandwidth (observed ~23 GB/s vs ~25+ achievable on 3xNVMe
+// RAID0). With io_uring + O_DIRECT, reads are submitted in batch and QD rises,
+// approaching the physical random-read bandwidth. Requires the binary to be
+// built with liburing (USE_URING compile flag, auto-detected by CMake); if not
+// compiled in, this flag is accepted but has no effect (falls back to pread).
+DEFINE_bool(use_uring, true,
+            "Use io_uring + O_DIRECT for reads (default: true). Requires the "
+            "binary built with liburing (USE_URING). Significantly raises NVMe "
+            "queue depth and throughput vs synchronous pread.");
+
 // === Bucket-specific (only effective when backend=bucket) ===
 DEFINE_uint64(bucket_keys_limit, 500,
               "Max keys allowed in a single bucket (only effective for bucket "
@@ -465,6 +478,7 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
         static_cast<int64_t>(FLAGS_total_size_limit_bytes);
     config.total_keys_limit =
         static_cast<int64_t>(FLAGS_total_keys_limit);
+    config.use_uring = FLAGS_use_uring;
 
     switch (mode) {
         case BackendMode::BUCKET: {
@@ -835,6 +849,10 @@ void PrintBanner(BackendMode mode, size_t value_size, size_t batch_size,
     std::cout << "Drop page cache:  " << (FLAGS_drop_cache ? "yes" : "no")
               << " (cold SSD reads"
               << (FLAGS_drop_cache ? "" : " / warm-cache")
+              << ")\n";
+    std::cout << "io_uring:         " << (FLAGS_use_uring ? "enabled" : "disabled")
+              << " (reads"
+              << (FLAGS_use_uring ? " O_DIRECT batch" : " synchronous pread")
               << ")\n";
     std::cout << "-----------------------------------------------------\n";
 }
