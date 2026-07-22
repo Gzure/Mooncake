@@ -1,6 +1,7 @@
 #include <gflags/gflags.h>
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_io/urma/urma_benchmark_profile.hpp>
 
 #include "client_service.h"
 #include "config.h"
@@ -134,5 +135,8 @@ int main(int argc, char *argv[]) {
     LOG(INFO) << "Starting real client service on " << FLAGS_host << ":"
               << FLAGS_port;
 
-    return server.start();
+    auto result = server.start();
+    if (coro_io::urma_benchmark_profile::enabled())
+        coro_io::urma_benchmark_profile::print(std::cerr);
+    return result;
 }

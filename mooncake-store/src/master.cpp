@@ -10,6 +10,7 @@
 #include <memory>  // For std::unique_ptr
 #include <thread>  // For std::thread
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_io/urma/urma_benchmark_profile.hpp>
 #include <ylt/easylog/record.hpp>
 
 #include "default_config.h"
@@ -1218,6 +1219,9 @@ int main(int argc, char* argv[]) {
 
         server.stop();
         server_thread.join();
+
+        if (coro_io::urma_benchmark_profile::enabled())
+            coro_io::urma_benchmark_profile::print(std::cerr);
 
         if (shutdown_requested.load()) {
             LOG(INFO) << "Shutdown signal received, exiting gracefully";

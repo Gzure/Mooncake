@@ -22,6 +22,7 @@
 #include "glog/logging.h"
 #include "mooncake_logging.h"
 #include "real_client.h"
+#include <ylt/coro_io/urma/urma_benchmark_profile.hpp>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1587,5 +1588,9 @@ int main(int argc, char* argv[]) {
     }
 
     ret = bench.Run();
+
+    if (coro_io::urma_benchmark_profile::enabled())
+        coro_io::urma_benchmark_profile::print(std::cerr);
+
     return ret;
 }
