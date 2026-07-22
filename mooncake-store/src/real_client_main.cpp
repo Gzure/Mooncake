@@ -142,7 +142,7 @@ int main(int argc, char *argv[]) {
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
     pthread_sigmask(SIG_BLOCK, &mask, nullptr);
-    std::thread sig_thread([&server]() {
+    std::thread sig_thread([&server, &mask]() {
         int sig = 0;
         sigwait(&mask, &sig);
         LOG(INFO) << "Received signal " << sig << ", stopping server";
