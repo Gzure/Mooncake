@@ -548,10 +548,11 @@ void ResourceTracker::signalHandler(int signal) {
 }
 
 void ResourceTracker::exitHandler() {
-    // Print RPC stage profile as a backstop if the process exits normally
-    // (atexit path) rather than via signal.
-    if (coro_io::urma_benchmark_profile::enabled())
+    if (coro_io::urma_benchmark_profile::enabled()) {
+        std::fprintf(stderr, "\n=== RPC Profile (atexit path) ===\n");
         coro_io::urma_benchmark_profile::print(std::cerr);
+        std::fflush(stderr);
+    }
     getInstance().cleanupAllResources();
 }
 
@@ -599,8 +600,11 @@ void ResourceTracker::startSignalThread() {
 
                 // Print RPC stage profile before terminating (raise(sig)
                 // kills the process, so atexit won't fire).
-                if (coro_io::urma_benchmark_profile::enabled())
+                if (coro_io::urma_benchmark_profile::enabled()) {
+                    std::fprintf(stderr, "\n=== RPC Profile (signal path) ===\n");
                     coro_io::urma_benchmark_profile::print(std::cerr);
+                    std::fflush(stderr);
+                }
 
                 // Restore default action and re-raise to terminate normally
                 struct sigaction sa;
