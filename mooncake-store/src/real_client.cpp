@@ -23,6 +23,8 @@
 #include <optional>
 #include <vector>
 
+#include <ylt/coro_io/urma/urma_benchmark_profile.hpp>
+
 #include "mooncake_logging.h"
 
 #include "real_client.h"
@@ -545,7 +547,13 @@ void ResourceTracker::signalHandler(int signal) {
     raise(signal);
 }
 
-void ResourceTracker::exitHandler() { getInstance().cleanupAllResources(); }
+void ResourceTracker::exitHandler() {
+    // Print RPC stage profile as a backstop if the process exits normally
+    // (atexit path) rather than via signal.
+    if (coro_io::urma_benchmark_profile::enabled())
+        coro_io::urma_benchmark_profile::print(std::cerr);
+    getInstance().cleanupAllResources();
+}
 
 void ResourceTracker::startSignalThread() {
     std::call_once(signal_once_, [this]() {
@@ -588,6 +596,11 @@ void ResourceTracker::startSignalThread() {
                 LOG(INFO) << "Received signal " << sig
                           << ", cleaning up resources";
                 ResourceTracker::getInstance().cleanupAllResources();
+
+                // Print RPC stage profile before terminating (raise(sig)
+                // kills the process, so atexit won't fire).
+                if (coro_io::urma_benchmark_profile::enabled())
+                    coro_io::urma_benchmark_profile::print(std::cerr);
 
                 // Restore default action and re-raise to terminate normally
                 struct sigaction sa;

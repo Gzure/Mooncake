@@ -1,7 +1,5 @@
 #include <gflags/gflags.h>
 #include <csignal>
-#include <pthread.h>
-#include <signal.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/urma/urma_benchmark_profile.hpp>
 
@@ -133,22 +131,6 @@ int main(int argc, char *argv[]) {
 
     coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, FLAGS_host);
     RegisterClientRpcService(server, *client_inst);
-
-    // Block SIGINT/SIGTERM in main thread, handle via sigwait in a dedicated
-    // thread so Ctrl+C triggers graceful server.stop() instead of killing the
-    // process (which would skip the profile print).
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGINT);
-    sigaddset(&mask, SIGTERM);
-    pthread_sigmask(SIG_BLOCK, &mask, nullptr);
-    std::thread sig_thread([&server, &mask]() {
-        int sig = 0;
-        sigwait(&mask, &sig);
-        LOG(INFO) << "Received signal " << sig << ", stopping server";
-        server.stop();
-    });
-    sig_thread.detach();
 
     LOG(INFO) << "Starting real client service on " << FLAGS_host << ":"
               << FLAGS_port;
