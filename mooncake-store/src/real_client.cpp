@@ -497,7 +497,16 @@ ResourceTracker::ResourceTracker() {
     // startSignalThread) would prevent Python from raising KeyboardInterrupt,
     // causing the process to hang on Ctrl-C.  Detect Python at runtime via
     // dlsym so we don't need to include <Python.h> or change any public API.
-    if (!dlsym(RTLD_DEFAULT, "Py_IsInitialized")) {
+    // Allow force-enabling for standalone processes that happen to link
+    // libpython but don't use it.
+    bool python_detected = dlsym(RTLD_DEFAULT, "Py_IsInitialized") != nullptr;
+    const char* force = std::getenv("MC_FORCE_SIGNAL_HANDLER");
+    if (force && (std::string_view(force) == "1" ||
+                  std::string_view(force) == "on" ||
+                  std::string_view(force) == "true")) {
+        python_detected = false;
+    }
+    if (!python_detected) {
         // Standalone C/C++ process – install our own signal handling.
         startSignalThread();
     }
