@@ -1,5 +1,6 @@
 #include <gflags/gflags.h>
 #include <csignal>
+#include <cstdlib>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/coro_io/urma/urma_benchmark_profile.hpp>
 
@@ -92,6 +93,30 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
 }  // namespace mooncake
 
 int main(int argc, char *argv[]) {
+    // Install a minimal SIGINT/SIGTERM handler that prints the RPC profile
+    // before the process is killed.  This must be registered before
+    // ResourceTracker (which may or may not set up its own sigwait thread
+    // depending on Python detection).
+    struct sigaction sa;
+    sa.sa_handler = [](int sig) {
+        if (coro_io::urma_benchmark_profile::enabled()) {
+            std::fprintf(stderr, "\n=== RPC Profile (signal %d) ===\n", sig);
+            coro_io::urma_benchmark_profile::print(std::cerr);
+            std::fflush(stderr);
+        }
+        // Restore default and re-raise so the process terminates.
+        struct sigaction dfl;
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        dfl.sa_flags = 0;
+        sigaction(sig, &dfl, nullptr);
+        raise(sig);
+    };
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
     // Attention !!!
     // Initialization of ResourceTracker must be the most earliest.
     // Otherwise, the main thread will not apply signal mask before other
