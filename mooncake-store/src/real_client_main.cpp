@@ -131,6 +131,7 @@ int main(int argc, char *argv[]) {
         google::InitGoogleLogging(argv[0]);
     }
     mooncake::logging::ApplyMooncakeLogEnableToGlog();
+    FLAGS_logtostderr = true;
 
     size_t global_segment_size = string_to_byte_size(FLAGS_global_segment_size);
 #ifdef USE_ASCEND_DIRECT
