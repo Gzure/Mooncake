@@ -190,7 +190,8 @@ DEFINE_string(ssd_offload_path, "", "SSD offload directory path");
 
 DEFINE_string(scenario, "local_memory",
               "Benchmark scenario: local_memory, remote_memory, local_disk, "
-              "remote_disk, segment_write, segment_read");
+              "remote_disk, segment_write, segment_read, "
+              "segment_read_balanced, list_segments");
 DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
@@ -216,16 +217,17 @@ DEFINE_string(segments, "",
 DEFINE_uint64(master_admin_port, 9003,
               "Master admin HTTP port for auto-discovering segments");
 DEFINE_uint64(read_segment_nums, 0,
-              "Number of segments to read from in segment_read scenario (0 = "
-              "read from all segments)");
+              "Number of segments to read from in segment_read/"
+              "segment_read_balanced scenario (0 = read from all segments)");
 DEFINE_uint64(duration, 0,
-              "Duration in seconds for continuous reading in segment_read "
-              "scenario (0 = read num_keys once)");
+              "Duration in seconds for continuous reading in segment_read/"
+              "segment_read_balanced scenario (0 = read num_keys once)");
 DEFINE_uint64(statis_interval, 5,
-              "Statistics print interval in seconds for segment_read scenario");
+              "Statistics print interval in seconds for segment_read/"
+              "segment_read_balanced scenario");
 DEFINE_uint64(shuffle_seed, 0,
-              "Seed for deterministic shuffle of segment_read keys "
-              "(0 = disabled)");
+              "Seed for deterministic shuffle of segment_read/"
+              "segment_read_balanced keys (0 = disabled)");
 
 using Clock = std::chrono::steady_clock;
 using Nanos = std::chrono::nanoseconds;
@@ -857,6 +859,119 @@ class StressBenchmark {
         return RunSegmentReadDuration(read_segments, all_keys);
     }
 
+    // Like segment_read, but each batch_get_into call reads keys evenly spread
+    // across all segments: every consecutive group of FLAGS_batch_size keys
+    // contains batch_size/num_segments keys from each segment. This measures
+    // the read throughput when a single batch fans out to all segments rather
+    // than hitting one segment at a time.
+    int RunSegmentReadBalanced() {
+        auto segments = DiscoverSegmentsIfNeeded(
+            "--segments not specified, auto-discovering");
+        if (segments.empty()) {
+            return -1;
+        }
+        LOG(INFO) << "Discovered " << segments.size()
+                  << " segments from master";
+
+        size_t read_segment_nums = FLAGS_read_segment_nums;
+        if (read_segment_nums == 0 || read_segment_nums > segments.size()) {
+            read_segment_nums = segments.size();
+        }
+
+        std::vector<std::string> read_segments(
+            segments.begin(), segments.begin() + read_segment_nums);
+
+        size_t num_segments = read_segments.size();
+        if (FLAGS_batch_size < num_segments) {
+            LOG(ERROR) << "segment_read_balanced requires batch_size ("
+                      << FLAGS_batch_size
+                      << ") >= number of read segments (" << num_segments
+                      << ") so each batch can cover all segments";
+            return -1;
+        }
+        size_t keys_per_segment_per_batch = FLAGS_batch_size / num_segments;
+        size_t remainder_keys = FLAGS_batch_size % num_segments;
+
+        LOG(INFO) << "=== SEGMENT READ BALANCED MODE ===";
+        LOG(INFO) << "Reading from " << num_segments << " segments with "
+                  << FLAGS_num_threads << " threads";
+        for (size_t s = 0; s < read_segments.size(); ++s) {
+            LOG(INFO) << "  Segment [" << s << "]: " << read_segments[s];
+        }
+        LOG(INFO) << "Batch size: " << FLAGS_batch_size
+                  << " (keys per segment per batch: "
+                  << keys_per_segment_per_batch << ")";
+        LOG(INFO) << "Keys per segment: " << FLAGS_num_keys;
+        LOG(INFO) << "Duration: "
+                  << (FLAGS_duration > 0 ? std::to_string(FLAGS_duration) + "s"
+                                         : "single pass");
+        LOG(INFO) << "Stats interval: " << FLAGS_statis_interval << "s";
+
+        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
+        if (buf_ret != 0) return buf_ret;
+
+        // Build the key list as a sequence of balanced batches. Each batch
+        // holds batch_size keys: keys_per_segment_per_batch keys from each
+        // segment, interleaved segment-by-segment, with the first
+        // `remainder_keys` segments contributing one extra key so the batch
+        // is exactly batch_size. Because the layout repeats every
+        // batch_size keys, any batch_size-wide window a worker pulls is
+        // balanced across segments.
+        std::vector<std::string> all_keys;
+        all_keys.reserve(static_cast<size_t>(FLAGS_num_keys) *
+                         static_cast<size_t>(FLAGS_batch_size));
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            for (size_t s = 0; s < num_segments; ++s) {
+                size_t count = keys_per_segment_per_batch +
+                               (s < remainder_keys ? 1 : 0);
+                for (size_t k = 0; k < count; ++k) {
+                    all_keys.push_back(MakeSegmentKey(read_segments[s], i));
+                }
+            }
+        }
+        if (FLAGS_shuffle_seed != 0) {
+            // Round-stable shuffle: permute keys only within each batch so
+            // that batch-level balance across segments is preserved.
+            std::mt19937_64 rng(FLAGS_shuffle_seed);
+            size_t total = all_keys.size();
+            size_t full_batches = total / FLAGS_batch_size;
+            for (size_t b = 0; b < full_batches; ++b) {
+                auto begin = all_keys.begin() + b * FLAGS_batch_size;
+                std::shuffle(begin, begin + FLAGS_batch_size, rng);
+            }
+            size_t tail = total - full_batches * FLAGS_batch_size;
+            if (tail > 0) {
+                auto begin =
+                    all_keys.begin() + full_batches * FLAGS_batch_size;
+                std::shuffle(begin, begin + tail, rng);
+            }
+            LOG(INFO) << "Shuffled segment_read_balanced keys per-batch with "
+                      << "seed=" << FLAGS_shuffle_seed;
+        }
+        LOG(INFO) << "Total keys to read: " << all_keys.size();
+
+        size_t warmup_end =
+            std::min(static_cast<size_t>(FLAGS_warmup_keys), all_keys.size());
+        if (warmup_end > 0) {
+            LOG(INFO) << "Warmup: reading " << warmup_end << " keys...";
+            for (size_t i = 0; i < warmup_end; ++i) {
+                int64_t ret =
+                    client_->get_into(all_keys[i], buffer_, FLAGS_value_size);
+                if (ret < 0) {
+                    LOG(WARNING)
+                        << "Warmup get_into failed for key=" << all_keys[i]
+                        << " ret=" << ret;
+                }
+            }
+            LOG(INFO) << "Warmup complete";
+        }
+
+        if (FLAGS_duration == 0) {
+            return RunSegmentReadSinglePass(read_segments, all_keys);
+        }
+        return RunSegmentReadDuration(read_segments, all_keys);
+    }
+
     int RunSegmentReadSinglePass(const std::vector<std::string>& read_segments,
                                  const std::vector<std::string>& all_keys) {
         LOG(INFO) << "Single-pass read with " << FLAGS_num_threads
@@ -1298,6 +1413,8 @@ class StressBenchmark {
             return RunSegmentWrite();
         } else if (FLAGS_scenario == "segment_read") {
             return RunSegmentRead();
+        } else if (FLAGS_scenario == "segment_read_balanced") {
+            return RunSegmentReadBalanced();
         } else if (FLAGS_scenario == "list_segments") {
             return RunListSegments();
         } else if (FLAGS_scenario == "remote_memory" ||
