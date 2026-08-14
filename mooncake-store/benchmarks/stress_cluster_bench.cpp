@@ -12,6 +12,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -191,7 +192,8 @@ DEFINE_string(ssd_offload_path, "", "SSD offload directory path");
 DEFINE_string(scenario, "local_memory",
               "Benchmark scenario: local_memory, remote_memory, local_disk, "
               "remote_disk, segment_write, segment_read, "
-              "segment_read_balanced, list_segments");
+              "segment_read_direct, segment_read_balanced, "
+              "segment_read_balanced_direct, list_segments");
 DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
@@ -972,6 +974,660 @@ class StressBenchmark {
         return RunSegmentReadDuration(read_segments, all_keys);
     }
 
+    // ------------------------------------------------------------------
+    // "Direct read" scenarios: bypass per-key master query by issuing a
+    // single batch_query() (one master RPC) to populate a QueryResultCache,
+    // then reading via get_into_ranges(..., &cache). While the cache
+    // entries are unexpired, get_into_ranges skips the master query and
+    // reuses the cached replica descriptors for the actual transfer.
+    // This measures the read latency/throughput with metadata overhead
+    // amortized away.
+    // ------------------------------------------------------------------
+
+    // One batch_query() for all keys, returns a shared cache. Failed keys
+    // (errors / not-found) are skipped; reads of those keys will fall back
+    // to a per-key master query inside get_into_ranges, which is the safe
+    // default.
+    std::shared_ptr<mooncake::PyClient::QueryResultCache> BuildQueryResultCache(
+        const std::vector<std::string>& all_keys) {
+        auto qrs = client_->batch_query(all_keys);
+        auto cache = std::make_shared<mooncake::PyClient::QueryResultCache>();
+        cache->reserve(all_keys.size());
+        size_t ok = 0;
+        for (size_t i = 0; i < all_keys.size(); ++i) {
+            if (qrs[i].has_value()) {
+                cache->emplace(all_keys[i], std::move(qrs[i]));
+                ++ok;
+            }
+        }
+        LOG(INFO) << "Built query result cache: " << ok << "/" << all_keys.size()
+                  << " keys (one batch_query)";
+        return cache;
+    }
+
+    // Read [key_start, key_start+count) keys into buf via get_into_ranges
+    // using the cached replica metadata. Returns total bytes read.
+    int64_t ExecuteCachedRead(
+        char* buf, size_t key_start, size_t count,
+        const std::vector<std::string>& all_keys,
+        const mooncake::PyClient::QueryResultCache* cache) {
+        std::vector<void*> buffers = {buf};
+        std::vector<std::vector<std::string>> all_k(1);
+        std::vector<std::vector<std::vector<size_t>>> all_dst(1);
+        std::vector<std::vector<std::vector<size_t>>> all_src(1);
+        std::vector<std::vector<std::vector<size_t>>> all_sizes(1);
+
+        all_k[0].reserve(count);
+        all_dst[0].reserve(count);
+        all_src[0].reserve(count);
+        all_sizes[0].reserve(count);
+
+        for (size_t j = 0; j < count; ++j) {
+            all_k[0].push_back(all_keys[key_start + j]);
+            // One full-object fragment per key: read the whole value from
+            // source offset 0 into the destination slot for this key.
+            all_dst[0].push_back({j * FLAGS_value_size});
+            all_src[0].push_back({0});
+            all_sizes[0].push_back({FLAGS_value_size});
+        }
+
+        auto results = client_->get_into_ranges(buffers, all_k, all_dst,
+                                                 all_src, all_sizes, cache);
+        int64_t total = 0;
+        for (const auto& br : results) {
+            for (const auto& kr : br) {
+                for (int64_t r : kr) {
+                    if (r > 0) total += r;
+                }
+            }
+        }
+        return total;
+    }
+
+    int RunDirectReadSinglePass(
+        const std::vector<std::string>& read_segments,
+        const std::vector<std::string>& all_keys) {
+        LOG(INFO) << "Direct single-pass read with " << FLAGS_num_threads
+                  << " threads (batch_query once, then get_into_ranges)";
+
+        auto cache = BuildQueryResultCache(all_keys);
+        if (cache->empty()) {
+            LOG(ERROR) << "Query result cache is empty; cannot do direct read";
+            return -1;
+        }
+
+        size_t total_keys = all_keys.size();
+        size_t batch = FLAGS_batch_size;
+
+        BenchmarkStats stats;
+        stats.InitThreads(FLAGS_num_threads, total_keys / FLAGS_num_threads);
+        stats.StartTimer();
+
+        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+
+        auto threads = LaunchDirectReadWorkers(
+            FLAGS_num_threads, total_keys, batch, stats, start_latch,
+            done_latch, all_keys, cache.get());
+
+        done_latch.wait();
+        stats.StopTimer();
+
+        for (auto& th : threads) {
+            th.join();
+        }
+
+        stats.Finalize();
+
+        std::string title =
+            "SEGMENT READ DIRECT BENCHMARK [segments=" +
+            std::to_string(read_segments.size()) +
+            ", keys=" + std::to_string(total_keys) + "]";
+        stats.Print(title);
+        return 0;
+    }
+
+    int RunDirectReadDuration(
+        const std::vector<std::string>& read_segments,
+        const std::vector<std::string>& all_keys) {
+        LOG(INFO) << "Direct duration-based continuous read with "
+                  << FLAGS_num_threads << " threads for " << FLAGS_duration
+                  << "s, stats every " << FLAGS_statis_interval
+                  << "s (batch_query refreshes the cache each interval)";
+
+        auto cache = BuildQueryResultCache(all_keys);
+        if (cache->empty()) {
+            LOG(ERROR) << "Query result cache is empty; cannot do direct read";
+            return -1;
+        }
+
+        // Refreshable cache: swapped atomically by the stats thread each
+        // interval to keep leases fresh (default KV lease TTL is 10s;
+        // statis_interval defaults to 5s, so refreshing every interval
+        // keeps entries unexpired).
+        std::shared_ptr<mooncake::PyClient::QueryResultCache> current_cache = cache;
+        std::shared_mutex cache_mutex;
+
+        std::atomic<bool> stop_flag{false};
+        std::atomic<size_t> global_keys{0};
+        std::atomic<size_t> global_queries{0};
+        std::atomic<size_t> global_bytes{0};
+        std::atomic<size_t> global_failed{0};
+
+        std::vector<std::vector<int64_t>> thread_latencies(FLAGS_num_threads);
+        std::vector<std::mutex> latency_mutexes(FLAGS_num_threads);
+
+        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::vector<std::thread> threads;
+
+        size_t total_keys = all_keys.size();
+        size_t batch = FLAGS_batch_size;
+        size_t keys_per_thread =
+            (total_keys + FLAGS_num_threads - 1) / FLAGS_num_threads;
+
+        for (size_t t = 0; t < FLAGS_num_threads; ++t) {
+            threads.emplace_back([&, t, keys_per_thread, total_keys]() {
+                bindToSocket(t % NR_SOCKETS);
+                char* my_buf = thread_buffers_[t].ptr;
+
+                start_latch.arrive_and_wait();
+
+                size_t key_offset = t * keys_per_thread;
+                size_t key_idx = key_offset;
+
+                while (!stop_flag.load(std::memory_order_relaxed)) {
+                    // Snapshot the current cache pointer (readers don't
+                    // block a refresh; the old shared_ptr is kept alive).
+                    std::shared_ptr<mooncake::PyClient::QueryResultCache> cache_snap;
+                    {
+                        std::shared_lock<std::shared_mutex> lk(cache_mutex);
+                        cache_snap = current_cache;
+                    }
+                    const mooncake::PyClient::QueryResultCache* cache_ptr =
+                        cache_snap.get();
+
+                    // Always read a full batch (keys wrap around modulo
+                    // total_keys, mirroring RunSegmentReadDuration).
+                    size_t key_start = key_idx % total_keys;
+                    size_t count = std::min(batch, total_keys - key_start);
+                    if (count == 0) count = std::min(batch, total_keys);
+
+                    auto t0 = Clock::now();
+                    int64_t ret = ExecuteCachedRead(my_buf, key_start, count,
+                                                     all_keys, cache_ptr);
+                    auto t1 = Clock::now();
+                    int64_t latency_ns = ElapsedNanos(t0, t1);
+
+                    {
+                        std::lock_guard<std::mutex> lock(latency_mutexes[t]);
+                        thread_latencies[t].push_back(latency_ns);
+                    }
+
+                    if (ret < 0) {
+                        global_failed.fetch_add(count,
+                                                std::memory_order_relaxed);
+                    } else {
+                        global_bytes.fetch_add(static_cast<size_t>(ret),
+                                               std::memory_order_relaxed);
+                    }
+                    global_keys.fetch_add(count, std::memory_order_relaxed);
+                    global_queries.fetch_add(1, std::memory_order_relaxed);
+                    key_idx += count;
+                }
+            });
+        }
+
+        auto bench_start = Clock::now();
+        auto bench_end = bench_start + std::chrono::seconds(FLAGS_duration);
+        auto next_statis =
+            bench_start + std::chrono::seconds(FLAGS_statis_interval);
+
+        size_t prev_keys = 0;
+        size_t prev_queries = 0;
+        size_t prev_bytes = 0;
+        size_t prev_failed = 0;
+        auto prev_time = bench_start;
+
+        std::vector<IntervalLatencyStats> interval_stats_list;
+
+        std::cout << "\n";
+        std::cout << "========================================"
+                  << "========================================\n";
+        std::cout << "  SEGMENT READ DIRECT DURATION BENCHMARK [segments="
+                  << read_segments.size() << "]\n";
+        std::cout << "========================================"
+                  << "========================================\n";
+        std::cout << std::fixed << std::setprecision(2);
+
+        while (Clock::now() < bench_end) {
+            auto now = Clock::now();
+            if (now >= next_statis) {
+                size_t cur_keys = global_keys.load(std::memory_order_relaxed);
+                size_t cur_queries =
+                    global_queries.load(std::memory_order_relaxed);
+                size_t cur_bytes = global_bytes.load(std::memory_order_relaxed);
+                size_t cur_failed =
+                    global_failed.load(std::memory_order_relaxed);
+
+                double interval_sec = NanosToSec(ElapsedNanos(prev_time, now));
+                size_t interval_keys = cur_keys - prev_keys;
+                size_t interval_queries = cur_queries - prev_queries;
+                size_t interval_bytes = cur_bytes - prev_bytes;
+                size_t interval_failed = cur_failed - prev_failed;
+
+                double interval_throughput_mbps =
+                    (interval_sec > 0)
+                        ? (static_cast<double>(interval_bytes) / MB) /
+                              interval_sec
+                        : 0;
+                double interval_keys_per_sec =
+                    (interval_sec > 0)
+                        ? static_cast<double>(interval_keys) / interval_sec
+                        : 0;
+                double interval_queries_per_sec =
+                    (interval_sec > 0)
+                        ? static_cast<double>(interval_queries) / interval_sec
+                        : 0;
+
+                IntervalLatencyStats interval_stats;
+                interval_stats.throughput_mbps = interval_throughput_mbps;
+                interval_stats.keys_per_sec = interval_keys_per_sec;
+                interval_stats.queries_per_sec = interval_queries_per_sec;
+                for (size_t t = 0; t < FLAGS_num_threads; ++t) {
+                    std::lock_guard<std::mutex> lock(latency_mutexes[t]);
+                    interval_stats.latencies_ns.insert(
+                        interval_stats.latencies_ns.end(),
+                        thread_latencies[t].begin(),
+                        thread_latencies[t].end());
+                    thread_latencies[t].clear();
+                }
+                interval_stats.Finalize();
+                interval_stats_list.push_back(interval_stats);
+
+                // Refresh the cache to keep leases unexpired (default KV
+                // lease TTL is 10s; refreshing every statis_interval --
+                // default 5s -- keeps entries fresh so get_into_ranges
+                // keeps bypassing the per-key master query).
+                auto fresh = BuildQueryResultCache(all_keys);
+                {
+                    std::unique_lock<std::shared_mutex> lk(cache_mutex);
+                    current_cache = fresh;
+                }
+
+                double total_sec = NanosToSec(ElapsedNanos(bench_start, now));
+                double total_throughput_mbps =
+                    (total_sec > 0)
+                        ? (static_cast<double>(cur_bytes) / MB) / total_sec
+                        : 0;
+                double total_keys_per_sec =
+                    (total_sec > 0) ? static_cast<double>(cur_keys) / total_sec
+                                    : 0;
+                double total_queries_per_sec =
+                    (total_sec > 0)
+                        ? static_cast<double>(cur_queries) / total_sec
+                        : 0;
+
+                std::cout << "  [t=" << std::setw(6) << total_sec << "s]"
+                          << "  interval: " << interval_throughput_mbps
+                          << " MB/s, " << interval_keys_per_sec << " keys/s, "
+                          << interval_queries_per_sec << " qps"
+                          << " (failed=" << interval_failed << ")"
+                          << "  lat[us]: avg="
+                          << NanosToUs(interval_stats.avg_latency_ns)
+                          << ", P50="
+                          << NanosToUs(interval_stats.p50_latency_ns)
+                          << ", P90="
+                          << NanosToUs(interval_stats.p90_latency_ns)
+                          << ", P99="
+                          << NanosToUs(interval_stats.p99_latency_ns)
+                          << "  total: " << cur_queries << " queries, "
+                          << cur_keys << " keys, " << total_throughput_mbps
+                          << " MB/s, " << total_keys_per_sec << " keys/s, "
+                          << total_queries_per_sec << " qps"
+                          << " (failed=" << cur_failed << ")\n";
+
+                prev_keys = cur_keys;
+                prev_queries = cur_queries;
+                prev_bytes = cur_bytes;
+                prev_failed = cur_failed;
+                prev_time = now;
+                next_statis += std::chrono::seconds(FLAGS_statis_interval);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        stop_flag.store(true, std::memory_order_relaxed);
+        for (auto& th : threads) {
+            th.join();
+        }
+
+        // Final summary identical in shape to RunSegmentReadDuration.
+        auto final_time = Clock::now();
+        double total_sec = NanosToSec(ElapsedNanos(bench_start, final_time));
+        size_t final_keys = global_keys.load(std::memory_order_relaxed);
+        size_t final_queries = global_queries.load(std::memory_order_relaxed);
+        size_t final_bytes = global_bytes.load(std::memory_order_relaxed);
+        size_t final_failed = global_failed.load(std::memory_order_relaxed);
+
+        double final_throughput_mbps =
+            (total_sec > 0)
+                ? (static_cast<double>(final_bytes) / MB) / total_sec
+                : 0;
+        double final_keys_per_sec =
+            (total_sec > 0) ? static_cast<double>(final_keys) / total_sec : 0;
+        double final_queries_per_sec =
+            (total_sec > 0) ? static_cast<double>(final_queries) / total_sec
+                            : 0;
+
+        IntervalLatencyStats overall;
+        for (const auto& s : interval_stats_list) {
+            overall.Aggregate(s);
+        }
+        double avg_throughput_mbps =
+            !interval_stats_list.empty()
+                ? overall.throughput_mbps / interval_stats_list.size()
+                : 0;
+        size_t total_latency_samples = overall.total_samples;
+
+        std::cout << "\n  FINAL SUMMARY\n";
+        std::cout << "  Total time:       " << total_sec << " s\n";
+        std::cout << "  Total queries:    " << final_queries
+                  << " (failed: " << final_failed << ")\n";
+        std::cout << "  Total keys:       " << final_keys << "\n";
+        std::cout << "  Total data:       " << FormatBytes(final_bytes) << "\n";
+        std::cout << "  Throughput:       " << final_throughput_mbps
+                  << " MB/s (avg: " << avg_throughput_mbps << " MB/s)";
+        if (final_throughput_mbps > 1024) {
+            std::cout << " (" << final_throughput_mbps / 1024 << " GB/s)";
+        }
+        std::cout << "\n";
+        std::cout << "  Keys/sec:         " << final_keys_per_sec << "\n";
+        std::cout << "  Queries/sec:      " << final_queries_per_sec << "\n";
+
+        if (total_latency_samples > 0) {
+            std::cout << "\n  Latency (us)      [n=" << total_latency_samples
+                      << ", per-query]\n";
+            std::cout << "    Min:   " << std::setw(12)
+                      << NanosToUs(overall.min_latency_ns) << "\n";
+            std::cout << "    Avg:   " << std::setw(12)
+                      << NanosToUs(overall.avg_latency_ns) << "\n";
+            std::cout << "    P50:   " << std::setw(12)
+                      << NanosToUs(overall.p50_latency_ns) << "\n";
+            std::cout << "    P90:   " << std::setw(12)
+                      << NanosToUs(overall.p90_latency_ns) << "\n";
+            std::cout << "    P99:   " << std::setw(12)
+                      << NanosToUs(overall.p99_latency_ns);
+            if (total_latency_samples < 100) std::cout << "  (n<100)";
+            std::cout << "\n";
+            std::cout << "    P999:  " << std::setw(12)
+                      << NanosToUs(overall.p999_latency_ns);
+            if (total_latency_samples < 1000) std::cout << "  (n<1000)";
+            std::cout << "\n";
+            std::cout << "    P9999: " << std::setw(12)
+                      << NanosToUs(overall.p9999_latency_ns);
+            if (total_latency_samples < 10000) std::cout << "  (n<10000)";
+            std::cout << "\n";
+            std::cout << "    Max:   " << std::setw(12)
+                      << NanosToUs(overall.max_latency_ns) << "\n";
+        }
+
+        std::cout << "========================================"
+                  << "========================================\n\n";
+
+        return 0;
+    }
+
+    // Launch direct-read worker threads. Each thread reads its assigned key
+    // range using get_into_ranges with the shared (read-only) query result
+    // cache. Mirrors LaunchReadWorkers but uses ExecuteCachedRead.
+    std::vector<std::thread> LaunchDirectReadWorkers(
+        size_t num_threads, size_t total_keys, size_t batch,
+        BenchmarkStats& stats, std::latch& start_latch,
+        std::latch& done_latch, const std::vector<std::string>& all_keys,
+        const mooncake::PyClient::QueryResultCache* cache) {
+        std::vector<std::thread> threads;
+        // Each thread handles `batch` keys per query; total queries =
+        // ceil(total_keys / batch). Distribute queries across threads.
+        size_t total_queries =
+            (total_keys + batch - 1) / batch;
+        size_t queries_per_thread = total_queries / num_threads;
+        size_t remainder = total_queries % num_threads;
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            size_t my_queries = queries_per_thread + (t < remainder ? 1 : 0);
+            size_t query_offset = t * queries_per_thread + std::min(t, remainder);
+
+            threads.emplace_back(
+                [&, t, my_queries, query_offset, batch, total_keys]() {
+                    DirectReadWorker(t, my_queries, query_offset, batch,
+                                     total_keys, stats, start_latch, done_latch,
+                                     all_keys, cache);
+                });
+        }
+        return threads;
+    }
+
+    void DirectReadWorker(size_t tid, size_t my_queries, size_t query_offset,
+                          size_t batch, size_t total_keys, BenchmarkStats& stats,
+                          std::latch& start_latch, std::latch& done_latch,
+                          const std::vector<std::string>& all_keys,
+                          const mooncake::PyClient::QueryResultCache* cache) {
+        bindToSocket(tid % NR_SOCKETS);
+
+        ThreadResult& result = stats.GetThreadResult(tid);
+        result.latencies_ns.reserve(my_queries);
+
+        char* my_buf = thread_buffers_[tid].ptr;
+
+        start_latch.arrive_and_wait();
+
+        size_t keys = 0;
+        size_t queries = 0;
+        size_t failed = 0;
+        size_t bytes = 0;
+
+        for (size_t q = 0; q < my_queries; ++q) {
+            size_t global_q = query_offset + q;
+            size_t key_start = global_q * batch;
+            if (key_start >= total_keys) break;
+            size_t count = std::min(batch, total_keys - key_start);
+
+            auto t0 = Clock::now();
+            int64_t ret = ExecuteCachedRead(my_buf, key_start, count, all_keys,
+                                             cache);
+            auto t1 = Clock::now();
+            int64_t lat_ns = ElapsedNanos(t0, t1);
+            result.latencies_ns.push_back(lat_ns);
+
+            if (ret < 0) {
+                failed += count;
+            } else {
+                bytes += static_cast<size_t>(ret);
+            }
+            keys += count;
+            ++queries;
+        }
+
+        result.total_bytes = bytes;
+        result.total_keys = keys;
+        result.total_queries = queries;
+        result.failed_ops = failed;
+
+        done_latch.arrive_and_wait();
+    }
+
+    int RunSegmentReadDirect() {
+        auto segments = DiscoverSegmentsIfNeeded(
+            "--segments not specified, auto-discovering");
+        if (segments.empty()) {
+            return -1;
+        }
+        LOG(INFO) << "Discovered " << segments.size()
+                  << " segments from master";
+
+        size_t read_segment_nums = FLAGS_read_segment_nums;
+        if (read_segment_nums == 0 || read_segment_nums > segments.size()) {
+            read_segment_nums = segments.size();
+        }
+
+        std::vector<std::string> read_segments(
+            segments.begin(), segments.begin() + read_segment_nums);
+
+        LOG(INFO) << "=== SEGMENT READ DIRECT MODE ===";
+        LOG(INFO) << "Reading from " << read_segment_nums << " segments ("
+                  << read_segment_nums << " nodes), bypassing per-key master "
+                  << "query via batch_query + cached get_into_ranges";
+        for (size_t s = 0; s < read_segments.size(); ++s) {
+            LOG(INFO) << "  Segment [" << s << "]: " << read_segments[s];
+        }
+        LOG(INFO) << "Keys per segment: " << FLAGS_num_keys;
+        LOG(INFO) << "Duration: "
+                  << (FLAGS_duration > 0 ? std::to_string(FLAGS_duration) + "s"
+                                         : "single pass");
+        LOG(INFO) << "Stats interval: " << FLAGS_statis_interval << "s";
+
+        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
+        if (buf_ret != 0) return buf_ret;
+
+        // Flat key list: all of segment 0's keys, then segment 1's, etc.
+        std::vector<std::string> all_keys;
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            for (size_t s = 0; s < read_segments.size(); ++s) {
+                all_keys.push_back(MakeSegmentKey(read_segments[s], i));
+            }
+        }
+        if (FLAGS_shuffle_seed != 0) {
+            std::mt19937_64 rng(FLAGS_shuffle_seed);
+            std::shuffle(all_keys.begin(), all_keys.end(), rng);
+            LOG(INFO) << "Shuffled segment_read_direct keys with seed="
+                      << FLAGS_shuffle_seed;
+        }
+        LOG(INFO) << "Total keys to read: " << all_keys.size();
+
+        size_t warmup_end =
+            std::min(static_cast<size_t>(FLAGS_warmup_keys), all_keys.size());
+        if (warmup_end > 0) {
+            LOG(INFO) << "Warmup: reading " << warmup_end << " keys...";
+            for (size_t i = 0; i < warmup_end; ++i) {
+                int64_t ret =
+                    client_->get_into(all_keys[i], buffer_, FLAGS_value_size);
+                if (ret < 0) {
+                    LOG(WARNING)
+                        << "Warmup get_into failed for key=" << all_keys[i]
+                        << " ret=" << ret;
+                }
+            }
+            LOG(INFO) << "Warmup complete";
+        }
+
+        if (FLAGS_duration == 0) {
+            return RunDirectReadSinglePass(read_segments, all_keys);
+        }
+        return RunDirectReadDuration(read_segments, all_keys);
+    }
+
+    int RunSegmentReadBalancedDirect() {
+        auto segments = DiscoverSegmentsIfNeeded(
+            "--segments not specified, auto-discovering");
+        if (segments.empty()) {
+            return -1;
+        }
+        LOG(INFO) << "Discovered " << segments.size()
+                  << " segments from master";
+
+        size_t read_segment_nums = FLAGS_read_segment_nums;
+        if (read_segment_nums == 0 || read_segment_nums > segments.size()) {
+            read_segment_nums = segments.size();
+        }
+
+        std::vector<std::string> read_segments(
+            segments.begin(), segments.begin() + read_segment_nums);
+
+        size_t num_segments = read_segments.size();
+        if (FLAGS_batch_size < num_segments) {
+            LOG(ERROR) << "segment_read_balanced_direct requires batch_size ("
+                      << FLAGS_batch_size
+                      << ") >= number of read segments (" << num_segments
+                      << ") so each batch can cover all segments";
+            return -1;
+        }
+        size_t keys_per_segment_per_batch = FLAGS_batch_size / num_segments;
+        size_t remainder_keys = FLAGS_batch_size % num_segments;
+
+        LOG(INFO) << "=== SEGMENT READ BALANCED DIRECT MODE ===";
+        LOG(INFO) << "Reading from " << num_segments << " segments with "
+                  << FLAGS_num_threads << " threads, bypassing per-key master "
+                  << "query via batch_query + cached get_into_ranges";
+        for (size_t s = 0; s < read_segments.size(); ++s) {
+            LOG(INFO) << "  Segment [" << s << "]: " << read_segments[s];
+        }
+        LOG(INFO) << "Batch size: " << FLAGS_batch_size
+                  << " (keys per segment per batch: "
+                  << keys_per_segment_per_batch << ")";
+        LOG(INFO) << "Keys per segment: " << FLAGS_num_keys;
+        LOG(INFO) << "Duration: "
+                  << (FLAGS_duration > 0 ? std::to_string(FLAGS_duration) + "s"
+                                         : "single pass");
+        LOG(INFO) << "Stats interval: " << FLAGS_statis_interval << "s";
+
+        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
+        if (buf_ret != 0) return buf_ret;
+
+        // Balanced key list: each consecutive batch_size keys span all
+        // segments evenly (mirrors RunSegmentReadBalanced).
+        std::vector<std::string> all_keys;
+        all_keys.reserve(static_cast<size_t>(FLAGS_num_keys) *
+                         static_cast<size_t>(FLAGS_batch_size));
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            for (size_t s = 0; s < num_segments; ++s) {
+                size_t count = keys_per_segment_per_batch +
+                               (s < remainder_keys ? 1 : 0);
+                for (size_t k = 0; k < count; ++k) {
+                    all_keys.push_back(MakeSegmentKey(read_segments[s], i));
+                }
+            }
+        }
+        if (FLAGS_shuffle_seed != 0) {
+            std::mt19937_64 rng(FLAGS_shuffle_seed);
+            size_t total = all_keys.size();
+            size_t full_batches = total / FLAGS_batch_size;
+            for (size_t b = 0; b < full_batches; ++b) {
+                auto begin = all_keys.begin() + b * FLAGS_batch_size;
+                std::shuffle(begin, begin + FLAGS_batch_size, rng);
+            }
+            size_t tail = total - full_batches * FLAGS_batch_size;
+            if (tail > 0) {
+                auto begin =
+                    all_keys.begin() + full_batches * FLAGS_batch_size;
+                std::shuffle(begin, begin + tail, rng);
+            }
+            LOG(INFO) << "Shuffled segment_read_balanced_direct keys per-batch "
+                      << "with seed=" << FLAGS_shuffle_seed;
+        }
+        LOG(INFO) << "Total keys to read: " << all_keys.size();
+
+        size_t warmup_end =
+            std::min(static_cast<size_t>(FLAGS_warmup_keys), all_keys.size());
+        if (warmup_end > 0) {
+            LOG(INFO) << "Warmup: reading " << warmup_end << " keys...";
+            for (size_t i = 0; i < warmup_end; ++i) {
+                int64_t ret =
+                    client_->get_into(all_keys[i], buffer_, FLAGS_value_size);
+                if (ret < 0) {
+                    LOG(WARNING)
+                        << "Warmup get_into failed for key=" << all_keys[i]
+                        << " ret=" << ret;
+                }
+            }
+            LOG(INFO) << "Warmup complete";
+        }
+
+        if (FLAGS_duration == 0) {
+            return RunDirectReadSinglePass(read_segments, all_keys);
+        }
+        return RunDirectReadDuration(read_segments, all_keys);
+    }
+
     int RunSegmentReadSinglePass(const std::vector<std::string>& read_segments,
                                  const std::vector<std::string>& all_keys) {
         LOG(INFO) << "Single-pass read with " << FLAGS_num_threads
@@ -1413,8 +2069,12 @@ class StressBenchmark {
             return RunSegmentWrite();
         } else if (FLAGS_scenario == "segment_read") {
             return RunSegmentRead();
+        } else if (FLAGS_scenario == "segment_read_direct") {
+            return RunSegmentReadDirect();
         } else if (FLAGS_scenario == "segment_read_balanced") {
             return RunSegmentReadBalanced();
+        } else if (FLAGS_scenario == "segment_read_balanced_direct") {
+            return RunSegmentReadBalancedDirect();
         } else if (FLAGS_scenario == "list_segments") {
             return RunListSegments();
         } else if (FLAGS_scenario == "remote_memory" ||
