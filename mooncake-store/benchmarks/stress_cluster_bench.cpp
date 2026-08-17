@@ -24,6 +24,7 @@
 #include "glog/logging.h"
 #include "mooncake_logging.h"
 #include "real_client.h"
+#include "replica_selection.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1005,42 +1006,132 @@ class StressBenchmark {
         return cache;
     }
 
-    // Read [key_start, key_start+count) keys into buf via get_into_ranges
-    // using the cached replica metadata. Returns total bytes read.
+    // Read [key_start, key_start+count) keys into buf using pre-queried
+    // replica metadata from the cache. This mirrors the fast path of
+    // RealClient::batch_get_into_internal (SelectBestReplica +
+    // allocateSlices + client_->BatchGet) but skips its BatchQuery by
+    // reusing cached QueryResults. The single BatchGet call submits all
+    // transfers in parallel and waits once, avoiding the per-key
+    // serialization of get_into_ranges.
     int64_t ExecuteCachedRead(
         char* buf, size_t key_start, size_t count,
         const std::vector<std::string>& all_keys,
         const mooncake::PyClient::QueryResultCache* cache) {
-        std::vector<void*> buffers = {buf};
-        std::vector<std::vector<std::string>> all_k(1);
-        std::vector<std::vector<std::vector<size_t>>> all_dst(1);
-        std::vector<std::vector<std::vector<size_t>>> all_src(1);
-        std::vector<std::vector<std::vector<size_t>>> all_sizes(1);
+        if (count == 0) return 0;
 
-        all_k[0].reserve(count);
-        all_dst[0].reserve(count);
-        all_src[0].reserve(count);
-        all_sizes[0].reserve(count);
+        auto local_endpoints = client_->GetLocalEndpoints();
+
+        std::vector<std::string> batch_keys;
+        std::vector<mooncake::QueryResult> batch_query_results;
+        std::unordered_map<std::string, std::vector<mooncake::Slice>>
+            batch_slices;
+        batch_keys.reserve(count);
+        batch_query_results.reserve(count);
+
+        // Fallback keys whose replica is not a plain MEMORY replica
+        // (disk/local-disk) - use the standard batch_get_into for those.
+        std::vector<std::string> fallback_keys;
+        std::vector<void*> fallback_bufs;
+        std::vector<size_t> fallback_sizes;
+        fallback_keys.reserve(count);
+
+        int64_t total = 0;
 
         for (size_t j = 0; j < count; ++j) {
-            all_k[0].push_back(all_keys[key_start + j]);
-            // One full-object fragment per key: read the whole value from
-            // source offset 0 into the destination slot for this key.
-            all_dst[0].push_back({j * FLAGS_value_size});
-            all_src[0].push_back({0});
-            all_sizes[0].push_back({FLAGS_value_size});
+            const std::string& key = all_keys[key_start + j];
+
+            auto it = cache->find(key);
+            if (it == cache->end() || !it->second.has_value()) {
+                // Not in cache or query error: fall back to batch_get_into
+                // (which will query the master for this key).
+                fallback_keys.push_back(key);
+                fallback_bufs.push_back(buf + j * FLAGS_value_size);
+                fallback_sizes.push_back(FLAGS_value_size);
+                continue;
+            }
+
+            const auto& qr = it->second.value();
+            if (qr.replicas.empty()) {
+                fallback_keys.push_back(key);
+                fallback_bufs.push_back(buf + j * FLAGS_value_size);
+                fallback_sizes.push_back(FLAGS_value_size);
+                continue;
+            }
+
+            const auto* best_replica =
+                mooncake::SelectBestReplica(qr.replicas, local_endpoints);
+            if (!best_replica) {
+                fallback_keys.push_back(key);
+                fallback_bufs.push_back(buf + j * FLAGS_value_size);
+                fallback_sizes.push_back(FLAGS_value_size);
+                continue;
+            }
+
+            const auto replica = *best_replica;
+
+            // Only MEMORY replicas go through the fast BatchGet path;
+            // disk/local-disk are rare in segment_write benchmarks and go
+            // through the standard path.
+            if (!replica.is_memory_replica()) {
+                fallback_keys.push_back(key);
+                fallback_bufs.push_back(buf + j * FLAGS_value_size);
+                fallback_sizes.push_back(FLAGS_value_size);
+                continue;
+            }
+
+            uint64_t obj_size = mooncake::calculate_total_size(replica);
+            if (FLAGS_value_size < obj_size) {
+                LOG(ERROR) << "Buffer too small for key '" << key
+                           << "': required=" << obj_size;
+                continue;
+            }
+
+            std::vector<mooncake::Slice> slices;
+            mooncake::allocateSlices(slices, replica,
+                                     buf + j * FLAGS_value_size);
+
+            batch_keys.push_back(key);
+            // FilterQueryResult equivalent: a single-replica QueryResult so
+            // BatchGet picks exactly this replica.
+            batch_query_results.emplace_back(
+                mooncake::QueryResult({replica}, qr.lease_timeout,
+                                      qr.object_checksum));
+            batch_slices[key] = std::move(slices);
+            total += static_cast<int64_t>(obj_size);
         }
 
-        auto results = client_->get_into_ranges(buffers, all_k, all_dst,
-                                                 all_src, all_sizes, cache);
-        int64_t total = 0;
-        for (const auto& br : results) {
-            for (const auto& kr : br) {
-                for (int64_t r : kr) {
-                    if (r > 0) total += r;
+        // Fast path: one parallel BatchGet for all memory replicas.
+        if (!batch_keys.empty()) {
+            auto batch_results = client_->BatchGet(
+                batch_keys, batch_query_results, batch_slices);
+            for (size_t j = 0; j < batch_results.size(); ++j) {
+                if (!batch_results[j]) {
+                    LOG_EVERY_N(ERROR, 100)
+                        << "BatchGet failed for key='" << batch_keys[j]
+                        << "': "
+                        << mooncake::toString(batch_results[j].error());
+                    total -= static_cast<int64_t>(
+                        batch_query_results[j].replicas.empty()
+                            ? 0
+                            : mooncake::calculate_total_size(
+                                  batch_query_results[j].replicas[0]));
                 }
             }
         }
+
+        // Fallback path: standard batch_get_into for non-memory replicas or
+        // cache misses (queries the master for just those keys).
+        if (!fallback_keys.empty()) {
+            auto results = client_->batch_get_into(fallback_keys,
+                                                    fallback_bufs,
+                                                    fallback_sizes);
+            for (size_t j = 0; j < results.size(); ++j) {
+                if (results[j] > 0) {
+                    total += results[j];
+                }
+            }
+        }
+
         return total;
     }
 
