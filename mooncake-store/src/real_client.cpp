@@ -896,12 +896,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
-        // For UB, mount ONE segment per NUMA node (each bound to its node,
-        // location="cpu:N"). Memory is spread across ALL NUMA nodes by count,
+        // For UB, mount ONE segment per memory-bearing NUMA node (each bound to
+        // its node, location="cpu:N"). Memory is spread across all such nodes,
         // not just NIC-bearing ones: this works even with a single bonded
         // device (e.g. bonding_dev_0, NUMA=-1) where NIC-NUMA discovery would
-        // be empty, and it relies only on the (decimal) NUMA count, so it is
-        // unaffected by the hex "numa" attribute. Each segment then drives
+        // be empty. NUMA nodes without attached memory must be excluded before
+        // calculating per-node segment sizes. Each segment then drives
         // selectDevice (cpu:N -> local NIC, else any) and chip affinity
         // (cpu:N -> chip via numaNodeToChipId). Automatic whenever UB has more
         // than one NUMA node; independent of both MC_UB_NUMA_AFFINITY_ENABLE
@@ -913,12 +913,23 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             if (numa_count > 1) {
                 std::string nodes_str;
                 for (int i = 0; i < numa_count; ++i) {
+                    long long free_size = 0;
+                    long long node_size = numa_node_size64(i, &free_size);
+                    if (node_size <= 0) {
+                        MC_LOG(WARNING)
+                            << "UB per-NUMA: skipping NUMA node " << i
+                            << " because it has no attached memory";
+                        continue;
+                    }
                     ub_numa_nodes.push_back(i);
-                    if (i) nodes_str += ",";
+                    if (!nodes_str.empty()) nodes_str += ",";
                     nodes_str += std::to_string(i);
                 }
-                MC_LOG(INFO) << "UB per-NUMA mode: NUMA node count=" << numa_count
-                          << ", nodes=[" << nodes_str << "]";
+                MC_LOG(INFO) << "UB per-NUMA mode: NUMA node count="
+                             << numa_count
+                             << ", memory-bearing node count="
+                             << ub_numa_nodes.size() << ", nodes=[" << nodes_str
+                             << "]";
             }
         }
 #endif  // USE_UB
@@ -932,9 +943,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            // UB NUMA affinity: split this chunk into one segment per NIC-NUMA
-            // node, each physically bound to its node and registered with
-            // location "cpu:N" (so selectDevice picks the NUMA-local NIC).
+            // UB NUMA affinity: split this chunk into one segment per
+            // memory-bearing NUMA node, each physically bound to its node and
+            // registered with location "cpu:N" (so selectDevice picks the
+            // NUMA-local NIC).
 #ifdef USE_UB
             if (!ub_numa_nodes.empty()) {
                 size_t page_sz = should_use_hugepage
