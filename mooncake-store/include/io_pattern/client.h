@@ -1,7 +1,8 @@
 #pragma once
 
 #include "../types.h"
-#include "io_pattern/types.h"
+#include "reporter.h"
+#include "types.h"
 
 namespace mooncake::io_pattern {
 
