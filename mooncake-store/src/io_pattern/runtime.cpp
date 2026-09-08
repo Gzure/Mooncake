@@ -42,6 +42,10 @@ IoPatternRuntime::IoPatternRuntime(Handlers handlers, Config config)
         nullptr, std::make_shared<PrefixMatchAdmissionOps>());
     policy_ = std::make_shared<DegradingPolicyEngine>(workload_policy_, fallback);
     admission_worker_ = std::thread(&IoPatternRuntime::AdmissionWorker, this);
+    if (config_.report_driven_execution) {
+        report_worker_ =
+            std::thread(&IoPatternRuntime::ReportDrivenWorker, this);
+    }
 }
 
 IoPatternRuntime::~IoPatternRuntime() {
@@ -52,6 +56,13 @@ IoPatternRuntime::~IoPatternRuntime() {
     }
     admission_condition_.notify_all();
     if (admission_worker_.joinable()) admission_worker_.join();
+    {
+        std::lock_guard lock(report_mutex_);
+        report_stopping_ = true;
+        report_pending_ = false;
+    }
+    report_condition_.notify_all();
+    if (report_worker_.joinable()) report_worker_.join();
     if (reporter_) reporter_->Stop();
 }
 
@@ -177,6 +188,10 @@ PolicyExecutionStatus IoPatternRuntime::Execute(
     const std::vector<ObjectRef>& admissions, const std::string& session_id) {
     auto planned = BuildPolicy(eviction_tier, eviction_bytes, trace, admissions,
                                session_id);
+    return CommitPolicy(planned);
+}
+
+PolicyExecutionStatus IoPatternRuntime::CommitPolicy(PlannedPolicy& planned) {
     const auto& snapshot = planned.snapshot;
     const auto& result = planned.result;
     auto status = executor_.Execute(result);
@@ -278,6 +293,208 @@ ErrorCode IoPatternRuntime::ExecuteCommand(const PolicyCommand& command) {
     return status.admissions.empty() ? ErrorCode::OK : status.admissions.front();
 }
 
+void IoPatternRuntime::RequestReportDrivenExecution() {
+    if (!config_.report_driven_execution) return;
+    {
+        std::lock_guard lock(report_mutex_);
+        if (report_stopping_) return;
+        report_pending_ = true;
+    }
+    // notify_all: a concurrent WaitForReportDrivenIdle() must not swallow the
+    // worker's wakeup (predicates re-check under the mutex either way).
+    report_condition_.notify_all();
+}
+
+void IoPatternRuntime::WaitForReportDrivenIdle() {
+    if (!config_.report_driven_execution) return;
+    std::unique_lock lock(report_mutex_);
+    report_condition_.wait(lock, [this] {
+        return report_stopping_ || (!report_pending_ && !report_worker_busy_);
+    });
+}
+
+void IoPatternRuntime::ReportDrivenWorker() {
+    while (true) {
+        {
+            std::unique_lock lock(report_mutex_);
+            report_condition_.wait(lock, [this] {
+                return report_stopping_ || report_pending_;
+            });
+            if (report_stopping_) return;
+            report_pending_ = false;
+            report_worker_busy_ = true;
+        }
+        try {
+            RunReportDrivenCycle();
+        } catch (...) {
+            policy_->RecordFailure();
+            observability_.RecordDegrade();
+        }
+        {
+            std::lock_guard lock(report_mutex_);
+            report_worker_busy_ = false;
+        }
+        report_condition_.notify_all();
+    }
+}
+
+void IoPatternRuntime::DeriveEvictionRequest(const IoPatternSnapshot& snapshot,
+                                             float high_ratio,
+                                             float target_ratio,
+                                             CacheTier& eviction_tier,
+                                             uint64_t& eviction_bytes) {
+    // The Store-side eviction handler is tenant-qualified MEMORY (L1) quota
+    // eviction; L2/L3 pressure is handled by the legacy NoF/SSD paths outside
+    // the IO Pattern runtime. Restrict the report-driven eviction dimension to
+    // host-memory watermarks so L2/L3 reports never route lower-tier keys into
+    // the memory quota eviction handler.
+    eviction_tier = CacheTier::kL1Host;
+    eviction_bytes = 0;
+    float peak_ratio = 0.0F;
+    uint64_t capacity_bytes = 0;
+    for (const auto& metric : snapshot.storage) {
+        if (metric.tier != CacheTier::kL1Host) continue;
+        if (metric.memory_used_ratio > peak_ratio) {
+            peak_ratio = metric.memory_used_ratio;
+            capacity_bytes = metric.capacity_bytes;
+        }
+    }
+    // No merged host-memory watermark, or below the high watermark: the merged
+    // snapshot does not indicate pressure, so the eviction dimension produces
+    // no action (the prefetch/admission dimensions are still evaluated).
+    if (peak_ratio < high_ratio) return;
+    // An eviction plan needs L1 keys to select candidates from. A report that
+    // only carries storage watermarks (no key observations for this tier)
+    // would otherwise execute an empty eviction plan through the handler on
+    // every cycle.
+    bool any_l1_keys = false;
+    for (const auto& key : snapshot.keys) {
+        if ((key.replica_tiers & CacheTierBit(CacheTier::kL1Host)) != 0) {
+            any_l1_keys = true;
+            break;
+        }
+    }
+    if (!any_l1_keys) return;
+    if (capacity_bytes == 0) {
+        for (const auto& metric : snapshot.storage) {
+            if (metric.tier == CacheTier::kL1Host &&
+                metric.memory_used_ratio == peak_ratio &&
+                metric.used_bytes != 0) {
+                capacity_bytes = static_cast<uint64_t>(
+                    static_cast<double>(metric.used_bytes) /
+                    static_cast<double>(metric.memory_used_ratio));
+                break;
+            }
+        }
+    }
+    const double reclaim_fraction =
+        static_cast<double>(peak_ratio) - static_cast<double>(target_ratio);
+    if (reclaim_fraction <= 0.0) return;
+    const double target = reclaim_fraction * static_cast<double>(capacity_bytes);
+    eviction_bytes = target > 0.0
+                         ? static_cast<uint64_t>(target)
+                         : (capacity_bytes > 0 ? capacity_bytes / 10 : 0);
+}
+
+TraceHistory IoPatternRuntime::DeriveTraceHistory(
+    const IoPatternSnapshot& snapshot) {
+    // Report-driven prefetch input: keys that were recently served as hits and
+    // still have a lower-tier replica are the ones a promotion should bring
+    // closer to the head. TraceBasedPrefetchOps re-applies its own
+    // match-length / confidence gates against this candidate trace.
+    TraceHistory trace;
+    const auto now_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    for (const auto& key : snapshot.keys) {
+        if (!key.active || key.access_count_window == 0) continue;
+        if ((key.replica_tiers & CacheTierBit(CacheTier::kL2Segment)) == 0 &&
+            (key.replica_tiers & CacheTierBit(CacheTier::kL3NofSsd)) == 0) {
+            continue;
+        }
+        trace.events.push_back(
+            TraceEvent{.object = key.object,
+                       .observed_at_ns = now_ns,
+                       .match_length = key.match_length,
+                       .is_hit = true});
+    }
+    return trace;
+}
+
+std::vector<ObjectRef> IoPatternRuntime::DeriveAdmissionCandidates(
+    const IoPatternSnapshot& snapshot) {
+    // Report-driven admission input: lower-tier objects that the merged
+    // reports show as hot (frequent reads) and that are not already in the
+    // head tier are promotion candidates. PrefixMatchAdmissionOps re-applies
+    // its frequency/watermark gates per object before execution.
+    std::vector<ObjectRef> candidates;
+    for (const auto& key : snapshot.keys) {
+        if (key.pinned || key.access_count_window == 0) continue;
+        const bool in_head =
+            (key.replica_tiers & CacheTierBit(CacheTier::kL1Host)) != 0;
+        const bool lower_tier =
+            (key.replica_tiers & CacheTierBit(CacheTier::kL2Segment)) != 0 ||
+            (key.replica_tiers & CacheTierBit(CacheTier::kL3NofSsd)) != 0;
+        if (!in_head && lower_tier) candidates.push_back(key.object);
+    }
+    return candidates;
+}
+
+void IoPatternRuntime::RunReportDrivenCycle() {
+    IoPatternSnapshot snapshot = collector_->GetSnapshot();
+    ReportDrivenCycleReport report;
+    report.cycle_id = ++report_cycle_id_;
+    report.keys_analyzed = snapshot.keys.size();
+    if (snapshot.keys.empty() && snapshot.storage.empty()) {
+        if (config_.report_driven_observer) {
+            config_.report_driven_observer(report);
+        }
+        return;
+    }
+    CacheTier eviction_tier = CacheTier::kL1Host;
+    uint64_t eviction_bytes = 0;
+    DeriveEvictionRequest(snapshot, config_.report_eviction_high_ratio,
+                          config_.report_eviction_target_ratio, eviction_tier,
+                          eviction_bytes);
+    report.eviction_tier = eviction_tier;
+    report.eviction_target_bytes = eviction_bytes;
+    const auto trace = DeriveTraceHistory(snapshot);
+    const auto admissions = DeriveAdmissionCandidates(snapshot);
+    report.admission_candidates = admissions.size();
+
+    auto planned = BuildPolicy(eviction_tier, eviction_bytes, trace,
+                               admissions, "report-driven");
+    report.analysis_elapsed_us = planned.analysis_elapsed_us;
+    const auto& result = planned.result;
+    report.eviction_candidates = result.eviction.candidates.size();
+    report.prefetch_candidates = result.prefetch.candidates.size();
+    size_t admitted = 0;
+    for (const auto& admission : result.admissions) {
+        if (admission.decision == AdmissionDecision::kAdmit) ++admitted;
+    }
+    report.admissions_admitted = admitted;
+    // A pressure report with no evictable L1 keys is a clean no-op for the
+    // eviction dimension, not a policy failure: do not invoke the storage
+    // handler with an empty candidate list (TierOperationExecutor otherwise
+    // forwards any non-zero target). Keep the derived target visible in the
+    // report for observability.
+    if (report.eviction_candidates == 0) {
+        planned.result.eviction.target_bytes = 0;
+        planned.result.eviction.candidates.clear();
+    }
+    const auto status = CommitPolicy(planned);
+    report.degraded = status.degraded || planned.result.degraded;
+    report.eviction_status = status.eviction;
+    report.prefetch_status = status.prefetch;
+    if (!status.admissions.empty()) {
+        report.admission_status = status.admissions.front();
+    }
+    if (config_.report_driven_observer) {
+        config_.report_driven_observer(report);
+    }
+}
+
 bool IoPatternRuntime::ScheduleAdmission(ObjectRef object, CacheTier target_tier,
                                          std::string session_id) {
     {
@@ -343,6 +560,11 @@ ErrorCode IoPatternRuntime::ExecuteAdmission(const ObjectRef& object,
 }
 
 void IoPatternRuntime::RecordFeedback(PolicyFeedbackSample sample) {
+    // Tuner state is not internally synchronized; the report-driven worker,
+    // the eviction thread and the data path can all reach RecordFeedback.
+    // feedback_state_mutex_ serializes them (all callers invoke this method
+    // outside that lock, so there is no recursive acquisition).
+    std::lock_guard lock(feedback_state_mutex_);
     feedback_.Record(sample);
     auto config = workload_policy_->CurrentEvictionConfig();
     if (tuner_.Tune(feedback_.Snapshot(), config)) {

@@ -3,8 +3,12 @@
 #include "io_pattern/policy_strategies.h"
 
 #include <memory>
+#include <atomic>
 #include <chrono>
 #include <future>
+#include <mutex>
+#include <condition_variable>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <variant>
@@ -1132,6 +1136,124 @@ TEST(IoPatternFrameworkTest, LocalCfmExecutesEvictionOnHighWatermarkSnapshot) {
                                          TraceHistory{});
     EXPECT_EQ(status.eviction, ErrorCode::OK);
     EXPECT_GE(runtime->ObservabilitySnapshot().policy_decisions, 1);
+}
+
+TEST(IoPatternFrameworkTest, ReportDrivenCycleRunsAfterMergedReport) {
+    // A merged client report must drive the local analysis -> decision ->
+    // execution cycle on the receiving runtime (the driver that makes remote
+    // SubMaster CFM execution observable), not only the local watermark
+    // thread, the Put admission hook or explicit execute_* RPCs.
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    std::optional<IoPatternRuntime::ReportDrivenCycleReport> last_report;
+    std::atomic<int> eviction_handled{0};
+    IoPatternRuntime::Config config;
+    config.report_driven_execution = true;
+    // Let the detached analyzer finish so pattern selection is deterministic
+    // in this test (the worker otherwise uses the 500 us bounded budget).
+    config.analysis_timeout_us = 30'000'000;
+    config.report_driven_observer =
+        [&](const IoPatternRuntime::ReportDrivenCycleReport& report) {
+            std::lock_guard lock(observer_mutex);
+            last_report = report;
+            observer_condition.notify_all();
+        };
+    auto rt = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [&eviction_handled](const EvictionPlan&) {
+                ++eviction_handled;
+                return ErrorCode::OK;
+            },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        std::move(config));
+    CfmService service(rt);
+    CfmBinaryCodec codec;
+    MetricBatch batch;
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "hot-key"},
+                     .observed_at_ns = 1,
+                     .block_size = 4096,
+                     .tier = CacheTier::kL1Host,
+                     .operation = IoOperation::kGet,
+                     .is_hit = true});
+    batch.storage.push_back(
+        StorageMetric{.source_id = "reporter",
+                      .observed_at_ns = 1,
+                      .tier = CacheTier::kL1Host,
+                      .used_bytes = 1024ULL * 1024 * 1024,
+                      .capacity_bytes = 1024ULL * 1024 * 1024,
+                      .memory_used_ratio = 0.95F});
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(batch)));
+
+    // Wait for the background cycle to drain the merged report.
+    std::unique_lock lock(observer_mutex);
+    ASSERT_TRUE(observer_condition.wait_for(lock, std::chrono::seconds(30), [&] {
+        return last_report.has_value();
+    }));
+    ASSERT_TRUE(last_report.has_value());
+    EXPECT_GE(last_report->cycle_id, 1);
+    EXPECT_GE(last_report->keys_analyzed, 1);
+    // 0.95 merged host-memory ratio exceeds the default 0.80 high watermark:
+    // the eviction dimension derived a target and executed through the
+    // storage handler.
+    EXPECT_GT(last_report->eviction_target_bytes, 0);
+    EXPECT_GT(eviction_handled.load(), 0);
+    EXPECT_EQ(last_report->eviction_status, ErrorCode::OK);
+}
+
+TEST(IoPatternFrameworkTest, ReportDrivenCycleSkipsEvictionWithoutPressure) {
+    // Below the high watermark the eviction dimension produces no action, but
+    // the cycle still runs so the report-driven pipeline stays observable.
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    std::optional<IoPatternRuntime::ReportDrivenCycleReport> last_report;
+    std::atomic<int> eviction_handled{0};
+    IoPatternRuntime::Config config;
+    config.report_driven_execution = true;
+    config.report_driven_observer =
+        [&](const IoPatternRuntime::ReportDrivenCycleReport& report) {
+            std::lock_guard lock(observer_mutex);
+            last_report = report;
+            observer_condition.notify_all();
+        };
+    auto rt = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [&eviction_handled](const EvictionPlan&) {
+                ++eviction_handled;
+                return ErrorCode::OK;
+            },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        std::move(config));
+    CfmService service(rt);
+    CfmBinaryCodec codec;
+    MetricBatch batch;
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "key"},
+                     .observed_at_ns = 1,
+                     .block_size = 1024,
+                     .tier = CacheTier::kL1Host,
+                     .operation = IoOperation::kGet,
+                     .is_hit = true});
+    batch.storage.push_back(
+        StorageMetric{.source_id = "reporter",
+                      .observed_at_ns = 1,
+                      .tier = CacheTier::kL1Host,
+                      .used_bytes = 512ULL * 1024 * 1024,
+                      .capacity_bytes = 1024ULL * 1024 * 1024,
+                      .memory_used_ratio = 0.50F});
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(batch)));
+
+    std::unique_lock lock(observer_mutex);
+    ASSERT_TRUE(observer_condition.wait_for(lock, std::chrono::seconds(5), [&] {
+        return last_report.has_value();
+    }));
+    ASSERT_TRUE(last_report.has_value());
+    EXPECT_EQ(last_report->eviction_target_bytes, 0);
+    EXPECT_EQ(eviction_handled.load(), 0);
 }
 
 TEST(IoPatternFrameworkTest, ReporterBackgroundLifecycleFlushesOnStop) {

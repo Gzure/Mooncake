@@ -277,8 +277,6 @@ class MasterMetricManager {
     // nof eviction metrics
     void inc_nof_eviction_success(int64_t key_count, int64_t size);
     void inc_nof_eviction_fail();  // not a single object is evicted
-
-    // Eviction Metrics Getters
     // total eviction metrics
     int64_t get_eviction_success();
     int64_t get_eviction_attempts();
@@ -294,6 +292,29 @@ class MasterMetricManager {
     int64_t get_nof_eviction_attempts();
     int64_t get_nof_evicted_key_count();
     int64_t get_nof_evicted_size();
+
+    // Report-driven IO Pattern policy execution metrics. These count the
+    // SubMaster-local policy cycles that run when merged client reports
+    // (report_snapshot / report_metric_batch) indicate storage pressure, so
+    // remote-mode eviction/prefetch/admission execution is observable in
+    // master admin metrics (not only the embedded watermark path).
+    void inc_io_pattern_report_cycles(int64_t val = 1);
+    void inc_io_pattern_report_evictions(int64_t val = 1);
+    void inc_io_pattern_report_eviction_failures(int64_t val = 1);
+    void inc_io_pattern_report_prefetches(int64_t val = 1);
+    void inc_io_pattern_report_prefetch_failures(int64_t val = 1);
+    void inc_io_pattern_report_admissions(int64_t val = 1);
+    void inc_io_pattern_report_admission_failures(int64_t val = 1);
+    void inc_io_pattern_report_degraded(int64_t val = 1);
+    // Report-driven IO Pattern execution metrics getters
+    int64_t get_io_pattern_report_cycles();
+    int64_t get_io_pattern_report_evictions();
+    int64_t get_io_pattern_report_eviction_failures();
+    int64_t get_io_pattern_report_prefetches();
+    int64_t get_io_pattern_report_prefetch_failures();
+    int64_t get_io_pattern_report_admissions();
+    int64_t get_io_pattern_report_admission_failures();
+    int64_t get_io_pattern_report_degraded();
 
     // PutStart Discard Metrics
     void inc_put_start_discard_cnt(int64_t count, int64_t size);
@@ -683,6 +704,16 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_eviction_attempts_;
     ylt::metric::counter_t nof_evicted_key_count_;
     ylt::metric::counter_t nof_evicted_size_;
+
+    // Report-driven IO Pattern policy execution metrics
+    ylt::metric::counter_t io_pattern_report_cycles_;
+    ylt::metric::counter_t io_pattern_report_evictions_;
+    ylt::metric::counter_t io_pattern_report_eviction_failures_;
+    ylt::metric::counter_t io_pattern_report_prefetches_;
+    ylt::metric::counter_t io_pattern_report_prefetch_failures_;
+    ylt::metric::counter_t io_pattern_report_admissions_;
+    ylt::metric::counter_t io_pattern_report_admission_failures_;
+    ylt::metric::counter_t io_pattern_report_degraded_;
 
     // PutStart Discard Metrics
     ylt::metric::counter_t put_start_discard_cnt_;

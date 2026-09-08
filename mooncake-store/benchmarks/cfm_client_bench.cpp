@@ -4,15 +4,17 @@
 // CFM is a component of every SubMaster; there is no standalone CFM Master and
 // no credential. A reporting client observes keys (KV blocks) and sends metric
 // batches over the SubMaster's regular coro_rpc endpoint. The SubMaster merges
-// reports into its local runtime, then policy evaluation and execution run
-// locally on the keys it owns (high-watermark eviction in the data path,
-// trace-derived prefetch through the same storage-safe handlers).
+// reports into its local runtime, then every merged report drives a local
+// analysis -> decision -> execution cycle (eviction/prefetch/promotion/
+// admission through the storage-safe handlers) on the keys it owns.
 //
 // This benchmark exercises that path in the following modes:
 //   - embedded (default): an in-process SubMaster runtime plays the owning
-//     CFM component. Reports are delivered in-process and policy is evaluated
-//     and executed locally, so the benchmark prints both report latency and
-//     the resulting eviction/prefetch/admission handler activity.
+//     CFM component. Reports are delivered in-process; the runtime's
+//     report-driven worker executes policy per report, and a final manual
+//     Execute emulates the production high-watermark trigger, so the benchmark
+//     prints report latency and the resulting eviction/prefetch/admission
+//     handler activity.
 //   - remote (--cfm_endpoint=host:port): reports go over coro_rpc to a single
 //     SubMaster CFM receiver.
 //   - remote via etcd (--cfm_endpoint=etcd://connstring): resolves the cluster
@@ -516,6 +518,12 @@ int main(int argc, char* argv[]) {
     std::string deployment_description;
     if (FLAGS_cfm_endpoint.empty()) {
         deployment_description = "embedded SubMaster (local CFM)";
+        IoPatternRuntime::Config cfm_config;
+        // Merged reports drive local analysis -> decision -> execution (same
+        // worker the production SubMaster runs), so handler counters below
+        // reflect report-triggered policy execution, not only the manual
+        // watermark evaluation at the end of the run.
+        cfm_config.report_driven_execution = true;
         cfm_runtime = std::make_shared<IoPatternRuntime>(
             IoPatternRuntime::Handlers{
                 .eviction = [&eviction_commands](const EvictionPlan&) {
@@ -529,7 +537,8 @@ int main(int argc, char* argv[]) {
                 .admission = [&admission_commands](const AdmissionResult&) {
                     ++admission_commands;
                     return ErrorCode::OK;
-                }});
+                }},
+            std::move(cfm_config));
         embedded_service = std::make_shared<CfmService>(cfm_runtime);
         auto transport =
             std::make_shared<EmbeddedCfmTransport>(embedded_service);
@@ -598,10 +607,21 @@ int main(int argc, char* argv[]) {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(FLAGS_report_flush_wait_ms));
 
-    // Embedded mode: evaluate and execute policy locally on the SubMaster
-    // runtime, exactly as the data-path high-watermark trigger does in
-    // production. The merged report above is what feeds that evaluation.
-    if (cfm_runtime && !cfm_runtime->Snapshot().keys.empty()) {
+    // The report-driven worker executes one cycle per merged report. Wait for
+    // it to drain before reading handler counters / snapshots so the printed
+    // numbers are deterministic.
+    if (cfm_runtime && cfm_runtime->report_driven_execution()) {
+        cfm_runtime->WaitForReportDrivenIdle();
+    }
+
+    // Embedded mode: when the report-driven worker is disabled, evaluate and
+    // execute policy once locally (the pre-worker high-watermark trigger that
+    // the production EvictionThreadFunc runs). With report_driven_execution
+    // enabled the runtime already executes a full cycle per merged report, so
+    // this extra pass is skipped to keep the printed handler counters equal to
+    // report-triggered executions only.
+    if (cfm_runtime && !cfm_runtime->report_driven_execution() &&
+        !cfm_runtime->Snapshot().keys.empty()) {
         const auto capacity = 1024ULL * 1024 * 1024;
         const auto target =
             static_cast<uint64_t>((FLAGS_memory_used_ratio - 0.80F) *
@@ -678,8 +698,12 @@ int main(int argc, char* argv[]) {
         std::cout << "    CFM keys / storage:    " << cfm_snapshot.keys.size()
                   << " / " << cfm_snapshot.storage.size() << "\n";
     } else {
-        std::cout << "    CFM keys / storage:    remote endpoint (not exposed to "
-                     "the client)\n";
+        // Remote execution cannot be read back by the client; observe the
+        // receiving SubMaster's own master admin metrics (`io_pattern_report_*`
+        // in `/metrics` and the periodic "Master Admin Metrics" log) and its
+        // [IO-PATTERN-REPORT-CYCLE] log lines.
+        std::cout << "    CFM keys / storage:    remote endpoint (see SubMaster "
+                     "master admin metrics)\n";
     }
     PrintObservability("Client", source_metrics);
     if (embedded_service) PrintObservability("CFM", cfm_metrics);

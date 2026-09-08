@@ -12,6 +12,7 @@ bool CfmIngress::Handle(std::string_view method, std::string_view payload,
         const auto snapshot = codec_->DecodeSnapshot(wire);
         if (!snapshot) return false;
         runtime_->MergeSnapshot(*snapshot);
+        runtime_->RequestReportDrivenExecution();
         return true;
     }
     if (method == "report_metric_batch") {
@@ -39,6 +40,15 @@ bool CfmIngress::Handle(std::string_view method, std::string_view payload,
             if (!source_id.empty()) normalized.source_id = source_id;
             normalized.observed_at_ns = received_at_ns;
             runtime_->RecordStorageMetric(normalized);
+        }
+        // A merged report is a fresh aggregate: run the local policy cycle so
+        // eviction/prefetch/promotion/admission execution is driven by remote
+        // reports, not only by the local watermark/admission threads or
+        // explicit execute_* RPCs. RequestReportDrivenExecution is
+        // non-blocking and coalesces bursts on the runtime's worker.
+        if (!batch->inference.empty() || !batch->accesses.empty() ||
+            !batch->storage.empty()) {
+            runtime_->RequestReportDrivenExecution();
         }
         return true;
     }

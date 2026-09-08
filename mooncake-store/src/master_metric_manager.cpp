@@ -330,6 +330,36 @@ MasterMetricManager::MasterMetricManager()
       nof_evicted_size_("master_evicted_size_bytes_nof",
                         "Total bytes of evicted objects in nof"),
 
+      // Report-driven IO Pattern policy execution metrics
+      io_pattern_report_cycles_(
+          "master_io_pattern_report_cycles_total",
+          "Total report-driven IO Pattern policy cycles executed after "
+          "merged client reports"),
+      io_pattern_report_evictions_(
+          "master_io_pattern_report_evictions_total",
+          "Total eviction executions from report-driven IO Pattern cycles"),
+      io_pattern_report_eviction_failures_(
+          "master_io_pattern_report_eviction_failures_total",
+          "Total failed eviction executions from report-driven IO Pattern "
+          "cycles"),
+      io_pattern_report_prefetches_(
+          "master_io_pattern_report_prefetches_total",
+          "Total prefetch executions from report-driven IO Pattern cycles"),
+      io_pattern_report_prefetch_failures_(
+          "master_io_pattern_report_prefetch_failures_total",
+          "Total failed prefetch executions from report-driven IO Pattern "
+          "cycles"),
+      io_pattern_report_admissions_(
+          "master_io_pattern_report_admissions_total",
+          "Total admission executions from report-driven IO Pattern cycles"),
+      io_pattern_report_admission_failures_(
+          "master_io_pattern_report_admission_failures_total",
+          "Total failed admission executions from report-driven IO Pattern "
+          "cycles"),
+      io_pattern_report_degraded_(
+          "master_io_pattern_report_degraded_total",
+          "Total degraded report-driven IO Pattern policy cycles"),
+
       // Initialize Discarded Replicas Counters
       put_start_discard_cnt_("master_put_start_discard_cnt",
                              "Total number of discarded PutStart operations"),
@@ -620,6 +650,16 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     eviction_attempts_.inc(0);
     evicted_key_count_.inc(0);
     evicted_size_.inc(0);
+
+    // Update report-driven IO Pattern policy execution counters
+    io_pattern_report_cycles_.inc(0);
+    io_pattern_report_evictions_.inc(0);
+    io_pattern_report_eviction_failures_.inc(0);
+    io_pattern_report_prefetches_.inc(0);
+    io_pattern_report_prefetch_failures_.inc(0);
+    io_pattern_report_admissions_.inc(0);
+    io_pattern_report_admission_failures_.inc(0);
+    io_pattern_report_degraded_.inc(0);
 
     // Update PutStart Discard Metrics
     put_start_discard_cnt_.inc(0);
@@ -1557,6 +1597,73 @@ int64_t MasterMetricManager::get_nof_evicted_size() {
     return nof_evicted_size_.value();
 }
 
+void MasterMetricManager::inc_io_pattern_report_cycles(int64_t val) {
+    io_pattern_report_cycles_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_evictions(int64_t val) {
+    io_pattern_report_evictions_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_eviction_failures(
+    int64_t val) {
+    io_pattern_report_eviction_failures_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_prefetches(int64_t val) {
+    io_pattern_report_prefetches_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_prefetch_failures(
+    int64_t val) {
+    io_pattern_report_prefetch_failures_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_admissions(int64_t val) {
+    io_pattern_report_admissions_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_admission_failures(
+    int64_t val) {
+    io_pattern_report_admission_failures_.inc(val);
+}
+
+void MasterMetricManager::inc_io_pattern_report_degraded(int64_t val) {
+    io_pattern_report_degraded_.inc(val);
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_cycles() {
+    return io_pattern_report_cycles_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_evictions() {
+    return io_pattern_report_evictions_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_eviction_failures() {
+    return io_pattern_report_eviction_failures_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_prefetches() {
+    return io_pattern_report_prefetches_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_prefetch_failures() {
+    return io_pattern_report_prefetch_failures_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_admissions() {
+    return io_pattern_report_admissions_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_admission_failures() {
+    return io_pattern_report_admission_failures_.value();
+}
+
+int64_t MasterMetricManager::get_io_pattern_report_degraded() {
+    return io_pattern_report_degraded_.value();
+}
+
 // PutStart Discard Metrics Getters
 int64_t MasterMetricManager::get_put_start_discard_cnt() {
     return put_start_discard_cnt_.value();
@@ -1936,6 +2043,16 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_eviction_attempts_);
     serialize_metric(nof_evicted_key_count_);
     serialize_metric(nof_evicted_size_);
+
+    // Serialize report-driven IO Pattern policy execution metrics
+    serialize_metric(io_pattern_report_cycles_);
+    serialize_metric(io_pattern_report_evictions_);
+    serialize_metric(io_pattern_report_eviction_failures_);
+    serialize_metric(io_pattern_report_prefetches_);
+    serialize_metric(io_pattern_report_prefetch_failures_);
+    serialize_metric(io_pattern_report_admissions_);
+    serialize_metric(io_pattern_report_admission_failures_);
+    serialize_metric(io_pattern_report_degraded_);
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);
@@ -2590,6 +2707,17 @@ std::string MasterMetricManager::get_summary_string(
        << nof_eviction_attempts << ", "
        << "keys=" << nof_evicted_key_count << ", "
        << "size=" << byte_size_to_string(nof_evicted_size);
+
+    // Report-driven IO Pattern policy execution summary (cumulative)
+    ss << " | IO Pattern (report-driven): "
+       << "cycles=" << io_pattern_report_cycles_.value() << ", "
+       << "evict=" << io_pattern_report_evictions_.value() << "/"
+       << io_pattern_report_eviction_failures_.value() << ", "
+       << "prefetch=" << io_pattern_report_prefetches_.value() << "/"
+       << io_pattern_report_prefetch_failures_.value() << ", "
+       << "admit=" << io_pattern_report_admissions_.value() << "/"
+       << io_pattern_report_admission_failures_.value() << ", "
+       << "degraded=" << io_pattern_report_degraded_.value();
 
     // Discard summary
     ss << " | Discard: "

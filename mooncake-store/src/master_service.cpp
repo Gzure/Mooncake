@@ -438,6 +438,67 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     io_pattern::IoPatternRuntime::Config io_pattern_config;
+    // Report-driven execution: a SubMaster that merges ownership-addressed
+    // client reports runs its own analysis -> decision -> execution cycle on
+    // every accepted report (report_snapshot / report_metric_batch). This is
+    // the driver that makes remote-mode CFM execution visible: without it
+    // policy only runs on the local watermark thread, the local Put admission
+    // path or explicit execute_* RPCs.
+    io_pattern_config.report_driven_execution = true;
+    // Mirror the master's own high/low watermark semantics so a merged-report
+    // eviction cycle reclaims the same excess as the local eviction thread
+    // (target ratio = high watermark - eviction ratio; clamped to >= 0).
+    io_pattern_config.report_eviction_high_ratio =
+        static_cast<float>(eviction_high_watermark_ratio_);
+    io_pattern_config.report_eviction_target_ratio = static_cast<float>(
+        std::max(0.0, eviction_high_watermark_ratio_ - eviction_ratio_));
+    io_pattern_config.report_driven_observer =
+        [](const io_pattern::IoPatternRuntime::ReportDrivenCycleReport& rpt) {
+            auto& metrics = MasterMetricManager::instance();
+            metrics.inc_io_pattern_report_cycles();
+            if (rpt.degraded) metrics.inc_io_pattern_report_degraded();
+            // A cycle "executes" a dimension when a plan reached the storage
+            // handler. The report-driven cycle only forwards an eviction plan
+            // with candidate keys (an empty-candidate pressure report is a
+            // clean no-op, not a failure); prefetch/admission likewise only
+            // reach their handler when candidates were planned. Failures are
+            // counted when the storage handler rejected the plan.
+            if (rpt.eviction_candidates != 0) {
+                metrics.inc_io_pattern_report_evictions();
+                if (rpt.eviction_status != ErrorCode::OK) {
+                    metrics.inc_io_pattern_report_eviction_failures();
+                }
+            }
+            if (rpt.prefetch_candidates != 0) {
+                metrics.inc_io_pattern_report_prefetches();
+                if (rpt.prefetch_status != ErrorCode::OK) {
+                    metrics.inc_io_pattern_report_prefetch_failures();
+                }
+            }
+            if (rpt.admissions_admitted != 0) {
+                metrics.inc_io_pattern_report_admissions();
+                if (rpt.admission_status != ErrorCode::OK) {
+                    metrics.inc_io_pattern_report_admission_failures();
+                }
+            }
+            LOG(INFO) << "[IO-PATTERN-REPORT-CYCLE] cycle=" << rpt.cycle_id
+                      << " keys_analyzed=" << rpt.keys_analyzed
+                      << " analysis_elapsed_us=" << rpt.analysis_elapsed_us
+                      << " degraded=" << rpt.degraded
+                      << " eviction(tier="
+                      << static_cast<int>(rpt.eviction_tier)
+                      << ", bytes=" << rpt.eviction_target_bytes
+                      << ", candidates=" << rpt.eviction_candidates
+                      << ", status=" << static_cast<int>(rpt.eviction_status)
+                      << ")"
+                      << " prefetch(candidates=" << rpt.prefetch_candidates
+                      << ", status=" << static_cast<int>(rpt.prefetch_status)
+                      << ")"
+                      << " admission(candidates=" << rpt.admission_candidates
+                      << ", admitted=" << rpt.admissions_admitted
+                      << ", status=" << static_cast<int>(rpt.admission_status)
+                      << ")";
+        };
     io_pattern_runtime_ = std::make_shared<io_pattern::IoPatternRuntime>(
         io_pattern::IoPatternRuntime::Handlers{
             .eviction =

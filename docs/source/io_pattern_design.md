@@ -1050,6 +1050,24 @@ explicitly drops observations whose owner cannot be resolved. The receiver
 merges every accepted report into the local runtime — there is no policy
 queue, poll, ACK or producer role to configure.
 
+Every accepted report also drives the local policy pipeline. The receiving
+SubMaster runs a background, coalescing `IoPatternRuntime` cycle after each
+`report_metric_batch` / `report_snapshot` merge. The cycle derives its
+decision inputs from the freshly aggregated snapshot: when the merged L1
+host-memory storage watermark (peak `memory_used_ratio` for `kL1Host` entries)
+exceeds the configured high ratio the cycle requests an eviction plan for host
+memory (target bytes = excess over the target ratio × reported capacity, only
+when the snapshot also contains L1 keys); keys that were recently served as
+hits and still carry L2/L3 replicas are fed to the prefetch ops, and hot
+lower-tier keys (not pinned, no L1 replica) are offered to the admission ops.
+Each cycle executes through the same storage-safe handlers, logs one
+`[IO-PATTERN-REPORT-CYCLE]` summary line and reports per-dimension outcomes to
+`MasterMetricManager` (`io_pattern_report_*` counters, visible on the master
+`/metrics` endpoint and in the periodic "Master Admin Metrics" log). This is
+what makes remote-mode policy execution observable: policy is no longer only
+run by the local memory-watermark thread, the local Put admission path or
+explicit `execute_*` RPCs.
+
 ## Implemented
 
 - `IoPatternCollectorImpl` aggregates inference, access and storage metrics by
@@ -1071,6 +1089,21 @@ queue, poll, ACK or producer role to configure.
 - `IoPatternRuntime` wires collection, bounded analysis, policy execution,
   feedback tuning and storage handlers; `MasterService` feeds it from actual
   Get/Put/watermark paths.
+- A coalescing report-driven execution worker (`report_driven_execution`
+  runtime config, enabled by `MasterService`) runs one full
+  Collector -> Analyzer -> PolicyEngine -> execution cycle after every merged
+  `report_metric_batch` / `report_snapshot`. The cycle derives an eviction
+  request only when the merged L1 host-memory storage watermark is above the
+  configured high ratio and the snapshot contains L1 keys, rebuilds a
+  prefetch trace from recently hit lower-tier keys and offers hot non-head
+  keys to the admission ops; an empty-candidate eviction is a clean no-op, not
+  a failure. Every cycle logs one `[IO-PATTERN-REPORT-CYCLE]` line and reports
+  its per-dimension outcome (eviction/prefetch/admission candidates, handler
+  statuses, degradation) to the process observer (`MasterMetricManager`
+  `io_pattern_report_*` counters on the master, visible in `/metrics` and the
+  "Master Admin Metrics" log). This keeps remote-mode policy execution
+  observable and data-driven instead of relying only on the local eviction
+  thread, the Put admission hook or explicit `execute_*` RPCs.
 - `CfmClientImpl` wraps a single reporting channel for connectors
   (`ReportSnapshot` / `ReportMetricBatch` / `ExecutePrefetch`); policy runs in
   the SubMaster's own runtime, so there is no client-side dispatch loop.

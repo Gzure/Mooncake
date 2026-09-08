@@ -2,7 +2,10 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,6 +37,31 @@ class IoPatternRuntime final {
         AdmissionHandler admission;
     };
 
+    // Outcome of one report-driven policy cycle. The cycle aggregates the
+    // merged collector snapshot, runs analysis -> decision and executes the
+    // three storage-safe flows (eviction, prefetch, admission); this report
+    // lets the owning process surface each execution in its own metrics.
+    struct ReportDrivenCycleReport {
+        uint64_t cycle_id{0};
+        size_t keys_analyzed{0};
+        uint64_t analysis_elapsed_us{0};
+        bool degraded{false};
+        // Eviction dimension (derived from merged storage watermarks).
+        CacheTier eviction_tier{CacheTier::kL1Host};
+        uint64_t eviction_target_bytes{0};
+        size_t eviction_candidates{0};
+        ErrorCode eviction_status{ErrorCode::OK};
+        // Prefetch dimension (derived from merged prefix-affinity keys).
+        size_t prefetch_candidates{0};
+        ErrorCode prefetch_status{ErrorCode::OK};
+        // Admission dimension (derived from merged lower-tier hot keys).
+        size_t admission_candidates{0};
+        size_t admissions_admitted{0};
+        ErrorCode admission_status{ErrorCode::OK};
+    };
+    using ReportDrivenObserver =
+        std::function<void(const ReportDrivenCycleReport&)>;
+
     struct Config {
         IoPatternCollectorImpl::Config collector;
         uint64_t analysis_window_ns{60'000'000'000ULL};
@@ -46,6 +74,27 @@ class IoPatternRuntime final {
         size_t max_pending_admissions{4096};
         MetricBatchSink report_sink;
         LegacyFallback legacy_fallback{LegacyFallback::kLru};
+        // Report-driven execution: after each client report (snapshot or
+        // metric batch) is merged, the runtime runs its own full
+        // Collector -> Analyzer -> PolicyEngine -> execution cycle. The
+        // eviction dimension is triggered by merged storage watermarks; the
+        // prefetch and admission dimensions are derived from the merged key
+        // set. Defaults keep the worker off for pure collector/reporter
+        // runtimes; MasterService enables it on the SubMaster that owns the
+        // reported keys.
+        bool report_driven_execution{false};
+        // Storage metric ratio (L1Host memory) at or above which the merged
+        // snapshot is considered under pressure and an eviction cycle is
+        // executed. Mirrors the master's own high-watermark trigger.
+        float report_eviction_high_ratio{0.80F};
+        // After an eviction cycle the tier is considered relieved once this
+        // ratio is reached; eviction target bytes are derived as
+        // (peak_ratio - report_eviction_target_ratio) * capacity_bytes.
+        float report_eviction_target_ratio{0.70F};
+        // Optional per-cycle observer used to surface executions in process
+        // metrics (e.g. MasterMetricManager). Never called from the report
+        // data path; only from the background cycle worker.
+        ReportDrivenObserver report_driven_observer;
     };
 
     explicit IoPatternRuntime(Handlers handlers);
@@ -64,6 +113,19 @@ class IoPatternRuntime final {
         const TraceHistory& trace,
         const std::vector<ObjectRef>& admissions = {},
         const std::string& session_id = {});
+    // Requests one report-driven cycle after merged report data. Coalesces:
+    // reports that arrive while a cycle is pending or running only mark the
+    // cycle dirty; the single background worker runs at most one full cycle
+    // per drain. Non-blocking for the report path.
+    void RequestReportDrivenExecution();
+    // Blocks until the background report-driven worker has drained all
+    // currently pending reports (no pending flag and no cycle in flight).
+    // Used by benchmarks/tests that must read deterministic counters after a
+    // known report burst. No-op when report-driven execution is disabled.
+    void WaitForReportDrivenIdle();
+    bool report_driven_execution() const {
+        return config_.report_driven_execution;
+    }
     // Runs Collector -> Analyzer -> PolicyEngine without invoking the local
     // storage handlers. Callers use Plan when they need the raw policy result
     // (for example the local eviction watermark path, observability or tests);
@@ -103,6 +165,22 @@ class IoPatternRuntime final {
     ErrorCode ExecuteAdmission(const ObjectRef& object, CacheTier target_tier,
                                const std::string& session_id);
 
+    // Report-driven cycle internals (single background worker).
+    void ReportDrivenWorker();
+    void RunReportDrivenCycle();
+    // Runs the executor over an already planned policy and records the shared
+    // outcome bookkeeping (policy failure/success, degradation, pending
+    // prefetch set and feedback). Used by both Execute() and the
+    // report-driven cycle so the two paths stay semantically identical.
+    PolicyExecutionStatus CommitPolicy(PlannedPolicy& planned);
+    static void DeriveEvictionRequest(const IoPatternSnapshot& snapshot,
+                                      float high_ratio, float target_ratio,
+                                      CacheTier& eviction_tier,
+                                      uint64_t& eviction_bytes);
+    static TraceHistory DeriveTraceHistory(const IoPatternSnapshot& snapshot);
+    static std::vector<ObjectRef> DeriveAdmissionCandidates(
+        const IoPatternSnapshot& snapshot);
+
     struct PendingAdmission {
         ObjectRef object;
         CacheTier target_tier{CacheTier::kL1Host};
@@ -133,6 +211,17 @@ class IoPatternRuntime final {
     std::deque<PendingAdmission> pending_admissions_;
     std::thread admission_worker_;
     bool admission_stopping_{false};
+
+    // Report-driven cycle worker state. Guarded by report_mutex_; the worker
+    // drains the pending flag and runs one cycle, then loops so reports that
+    // arrived during the cycle coalesce into the next drain.
+    std::mutex report_mutex_;
+    std::condition_variable report_condition_;
+    std::thread report_worker_;
+    bool report_pending_{false};
+    bool report_stopping_{false};
+    bool report_worker_busy_{false};
+    uint64_t report_cycle_id_{0};
 };
 
 }  // namespace mooncake::io_pattern
