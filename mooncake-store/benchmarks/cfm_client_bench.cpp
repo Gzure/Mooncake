@@ -195,7 +195,7 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
     const std::string connstring = entry.substr(scheme_pos + 3);
     const std::string cluster_namespace = ResolveCvmNamespace();
 
-    ErrorCode err = EtcdHelper::ConnectToEtcdStoreClient(connstring);
+    ErrorCode err = mooncake::EtcdHelper::ConnectToEtcdStoreClient(connstring);
     if (err != ErrorCode::OK) {
         LOG(FATAL) << "cfm_endpoint: failed to connect etcd '" << connstring
                    << "': " << toString(err);
@@ -206,8 +206,8 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
     const std::string view_key = BuildMasterViewKey(cluster_namespace);
     std::string leader_address;
     mooncake::EtcdRevisionId revision = 0;
-    err = EtcdHelper::Get(view_key.data(), view_key.size(), leader_address,
-                          revision);
+    err = mooncake::EtcdHelper::Get(view_key.data(), view_key.size(),
+                                    leader_address, revision);
     if (err == ErrorCode::OK && !leader_address.empty()) {
         LOG(INFO) << "cfm_endpoint: single-leader HA via " << view_key
                   << " -> " << leader_address;
@@ -222,10 +222,10 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
     }
 
     // CVM multi-submaster: masters registry + slot ownership.
-    std::vector<cvm::MasterRegistration> masters;
+    std::vector<mooncake::cvm::MasterRegistration> masters;
     mooncake::ViewVersionId version = 0;
-    err = cvm::EtcdViewStore::LoadAllMasters(cluster_namespace, masters,
-                                             version);
+    err = mooncake::cvm::EtcdViewStore::LoadAllMasters(cluster_namespace,
+                                                       masters, version);
     if (err != ErrorCode::OK) {
         LOG(FATAL) << "cfm_endpoint: LoadAllMasters failed for namespace '"
                    << cluster_namespace << "': " << toString(err);
@@ -235,7 +235,8 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
     std::map<std::string, std::string> address_by_master;  // id -> host:port
     std::vector<std::string> primary_ids;
     for (const auto& reg : masters) {
-        if (reg.role == static_cast<int32_t>(cvm::MasterRole::kPrimary) &&
+        if (reg.role ==
+                static_cast<int32_t>(mooncake::cvm::MasterRole::kPrimary) &&
             !reg.address.empty()) {
             address_by_master[reg.master_id] = reg.address;
             primary_ids.push_back(reg.master_id);
@@ -252,12 +253,13 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
     // Prefer the authoritative slot owner table published by CvmController;
     // fall back to the consistent-hash ring used by the masters themselves.
     std::unordered_map<uint16_t, std::string> owner_by_slot;
-    std::vector<cvm::SlotOwner> slot_owners;
-    const ErrorCode slot_err = cvm::EtcdViewStore::LoadAllSlotOwners(
+    std::vector<mooncake::cvm::SlotOwner> slot_owners;
+    const ErrorCode slot_err = mooncake::cvm::EtcdViewStore::LoadAllSlotOwners(
         cluster_namespace, slot_owners, version);
     if (slot_err == ErrorCode::OK) {
         for (const auto& owner : slot_owners) {
-            if (owner.state == static_cast<int32_t>(cvm::SlotState::kStable) &&
+            if (owner.state ==
+                    static_cast<int32_t>(mooncake::cvm::SlotState::kStable) &&
                 !owner.primary_master_id.empty()) {
                 owner_by_slot[owner.slot] = owner.primary_master_id;
             }
@@ -275,14 +277,14 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
             owner_by_slot = std::move(owner_by_slot), has_owner_table](
                const TenantId& tenant,
                const std::string& key) -> std::optional<std::string> {
-        const uint16_t slot = cvm::KeySlot(tenant, key);
+        const uint16_t slot = mooncake::cvm::KeySlot(tenant, key);
         std::string owner;
         if (has_owner_table) {
             const auto it = owner_by_slot.find(slot);
             if (it != owner_by_slot.end()) owner = it->second;
         }
         if (owner.empty()) {
-            owner = cvm::ResolveSlotOwnerOnRing(primary_ids, slot);
+            owner = mooncake::cvm::ResolveSlotOwnerOnRing(primary_ids, slot);
         }
         const auto address = address_by_master.find(owner);
         if (address == address_by_master.end()) return std::nullopt;
