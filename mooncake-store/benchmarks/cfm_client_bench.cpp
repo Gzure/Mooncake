@@ -8,44 +8,61 @@
 // locally on the keys it owns (high-watermark eviction in the data path,
 // trace-derived prefetch through the same storage-safe handlers).
 //
-// This benchmark exercises that path in two modes:
+// This benchmark exercises that path in the following modes:
 //   - embedded (default): an in-process SubMaster runtime plays the owning
 //     CFM component. Reports are delivered in-process and policy is evaluated
 //     and executed locally, so the benchmark prints both report latency and
 //     the resulting eviction/prefetch/admission handler activity.
-//   - remote (--cfm_endpoint=host:port): reports go over coro_rpc to a real
-//     SubMaster CFM receiver; the receiving side is not observable here, so
-//     only client-side latency is reported.
+//   - remote (--cfm_endpoint=host:port): reports go over coro_rpc to a single
+//     SubMaster CFM receiver.
+//   - remote via etcd (--cfm_endpoint=etcd://connstring): resolves the cluster
+//     like a Store client, then buckets each key to its owning SubMaster.
+//     The receiving side is not observable here, so only client-side latency
+//     is reported.
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
+#include "cvm/cvm_types.h"
+#include "cvm/etcd_view_store.h"
+#include "cvm/slot_hash.h"
+#include "io_pattern/cfm_ownership_client.h"
 #include "io_pattern/cfm_protocol.h"
 #include "io_pattern/cfm_service.h"
 #include "io_pattern/rpc_transport.h"
 #include "io_pattern/runtime.h"
+#include "types.h"
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#endif
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 using mooncake::ErrorCode;
 using mooncake::TenantId;
+using mooncake::toString;
 using namespace mooncake::io_pattern;
 
 DEFINE_uint64(requests, 20, "Number of vLLM-style inference requests");
@@ -68,8 +85,14 @@ DEFINE_string(tenant, "vllm-benchmark", "Tenant id");
 DEFINE_string(node_id, "vllm-submaster-0",
               "CFM node/submaster id that owns the reported keys");
 DEFINE_string(cfm_endpoint, "",
-              "Remote SubMaster coro_rpc endpoint (host:port); empty uses an "
-              "embedded in-process SubMaster CFM component");
+              "Remote SubMaster endpoint: either host:port or an HA entry "
+              "(e.g. etcd://host:2379;host2:2379). Empty uses an embedded "
+              "in-process SubMaster CFM component");
+DEFINE_string(cfm_cluster_namespace, "",
+              "CVM cluster namespace for etcd entry resolution; defaults to "
+              "MC_STORE_CLUSTER_ID or mooncake_cluster (same rule as the "
+              "etcd leader coordinator). When the cluster was started with a "
+              "non-default cluster_id, pass the same value here");
 
 uint64_t SteadyNowNs() {
     return static_cast<uint64_t>(
@@ -113,6 +136,160 @@ class EmbeddedCfmTransport final : public CfmRpcTransport {
    private:
     std::shared_ptr<CfmService> service_;
 };
+
+#ifdef STORE_USE_ETCD
+// Resolves the CVM cluster namespace used by --cfm_endpoint when it carries an
+// etcd:// backend. Mirrors EtcdLeaderCoordinator::ResolveClusterNamespace:
+// explicit flag wins, then MC_STORE_CLUSTER_ID, then mooncake_cluster.
+std::string ResolveCvmNamespace() {
+    if (!FLAGS_cfm_cluster_namespace.empty()) {
+        return FLAGS_cfm_cluster_namespace;
+    }
+    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
+    if (env_cluster_id != nullptr && std::strlen(env_cluster_id) > 0) {
+        return env_cluster_id;
+    }
+    return mooncake::DEFAULT_CLUSTER_ID;
+}
+
+// Key that stores the leader address for single-leader HA.
+// Mirrors EtcdLeaderCoordinator::BuildMasterViewKey.
+std::string BuildMasterViewKey(const std::string& cluster_namespace) {
+    std::string normalized = cluster_namespace;
+    if (!normalized.empty() && normalized.back() == '/') {
+        normalized.pop_back();
+    }
+    return "mooncake-store/" + normalized + "/master_view";
+}
+#endif  // STORE_USE_ETCD
+
+// If --cfm_endpoint names a single SubMaster directly ("host:port") this
+// returns an ownership resolver that routes every key to it. If it is an
+// etcd:// entry, it resolves the cluster like a Store client: a present
+// leader master_view yields a single target; otherwise the CVM
+// /cvm/<ns>/masters registry plus slot ownership is used to bucket keys to
+// their owning SubMaster. Returns an empty resolver on any resolution failure
+// (the caller aborts instead of hanging).
+SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
+    const std::string entry = FLAGS_cfm_endpoint;
+    const size_t scheme_pos = entry.find("://");
+    if (scheme_pos == std::string::npos) {
+        // Plain host:port -> every observed key belongs to this single
+        // SubMaster (the equivalent of the old single-endpoint remote mode).
+        const std::string endpoint = entry;
+        return [endpoint](const TenantId&, const std::string&)
+                   -> std::optional<std::string> { return endpoint; };
+    }
+#ifndef STORE_USE_ETCD
+    LOG(FATAL) << "cfm_endpoint entry '" << entry
+               << "' requires a build with STORE_USE_ETCD; pass host:port "
+                  "instead";
+    return {};
+#else
+    const std::string scheme = entry.substr(0, scheme_pos);
+    if (scheme != "etcd") {
+        LOG(FATAL) << "cfm_endpoint backend '" << scheme
+                   << "' is not supported; use host:port or etcd://connstring";
+        return {};
+    }
+    const std::string connstring = entry.substr(scheme_pos + 3);
+    const std::string cluster_namespace = ResolveCvmNamespace();
+
+    ErrorCode err = EtcdHelper::ConnectToEtcdStoreClient(connstring);
+    if (err != ErrorCode::OK) {
+        LOG(FATAL) << "cfm_endpoint: failed to connect etcd '" << connstring
+                   << "': " << toString(err);
+        return {};
+    }
+
+    // Single-leader HA: leader master_view holds the master address.
+    const std::string view_key = BuildMasterViewKey(cluster_namespace);
+    std::string leader_address;
+    mooncake::EtcdRevisionId revision = 0;
+    err = EtcdHelper::Get(view_key.data(), view_key.size(), leader_address,
+                          revision);
+    if (err == ErrorCode::OK && !leader_address.empty()) {
+        LOG(INFO) << "cfm_endpoint: single-leader HA via " << view_key
+                  << " -> " << leader_address;
+        const std::string endpoint = std::move(leader_address);
+        return [endpoint](const TenantId&, const std::string&)
+                   -> std::optional<std::string> { return endpoint; };
+    }
+    if (err != ErrorCode::OK && err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+        LOG(FATAL) << "cfm_endpoint: failed to read " << view_key << ": "
+                   << toString(err);
+        return {};
+    }
+
+    // CVM multi-submaster: masters registry + slot ownership.
+    std::vector<cvm::MasterRegistration> masters;
+    mooncake::ViewVersionId version = 0;
+    err = cvm::EtcdViewStore::LoadAllMasters(cluster_namespace, masters,
+                                             version);
+    if (err != ErrorCode::OK) {
+        LOG(FATAL) << "cfm_endpoint: LoadAllMasters failed for namespace '"
+                   << cluster_namespace << "': " << toString(err);
+        return {};
+    }
+
+    std::map<std::string, std::string> address_by_master;  // id -> host:port
+    std::vector<std::string> primary_ids;
+    for (const auto& reg : masters) {
+        if (reg.role == static_cast<int32_t>(cvm::MasterRole::kPrimary) &&
+            !reg.address.empty()) {
+            address_by_master[reg.master_id] = reg.address;
+            primary_ids.push_back(reg.master_id);
+        }
+    }
+    if (primary_ids.empty()) {
+        LOG(FATAL) << "cfm_endpoint: no primary SubMaster registered under "
+                      "/cvm/"
+                   << cluster_namespace << "/masters";
+        return {};
+    }
+    std::sort(primary_ids.begin(), primary_ids.end());
+
+    // Prefer the authoritative slot owner table published by CvmController;
+    // fall back to the consistent-hash ring used by the masters themselves.
+    std::unordered_map<uint16_t, std::string> owner_by_slot;
+    std::vector<cvm::SlotOwner> slot_owners;
+    const ErrorCode slot_err = cvm::EtcdViewStore::LoadAllSlotOwners(
+        cluster_namespace, slot_owners, version);
+    if (slot_err == ErrorCode::OK) {
+        for (const auto& owner : slot_owners) {
+            if (owner.state == static_cast<int32_t>(cvm::SlotState::kStable) &&
+                !owner.primary_master_id.empty()) {
+                owner_by_slot[owner.slot] = owner.primary_master_id;
+            }
+        }
+    }
+    const bool has_owner_table = !owner_by_slot.empty();
+    LOG(INFO) << "cfm_endpoint: CVM namespace '" << cluster_namespace
+              << "' has " << primary_ids.size() << " primary submaster(s), "
+              << (has_owner_table ? owner_by_slot.size() : 0)
+              << " slot owners"
+              << (has_owner_table ? "" : " (falling back to hash ring)");
+
+    return [address_by_master = std::move(address_by_master),
+            primary_ids = std::move(primary_ids),
+            owner_by_slot = std::move(owner_by_slot), has_owner_table](
+               const TenantId& tenant,
+               const std::string& key) -> std::optional<std::string> {
+        const uint16_t slot = cvm::KeySlot(tenant, key);
+        std::string owner;
+        if (has_owner_table) {
+            const auto it = owner_by_slot.find(slot);
+            if (it != owner_by_slot.end()) owner = it->second;
+        }
+        if (owner.empty()) {
+            owner = cvm::ResolveSlotOwnerOnRing(primary_ids, slot);
+        }
+        const auto address = address_by_master.find(owner);
+        if (address == address_by_master.end()) return std::nullopt;
+        return address->second;
+    };
+#endif
+}
 
 class LatencyStats final {
    public:
@@ -328,12 +505,15 @@ int main(int argc, char* argv[]) {
     std::atomic<uint64_t> prefetch_commands{0};
     std::atomic<uint64_t> admission_commands{0};
 
-    // The SubMaster-side CFM component (embedded mode) or the target of the
-    // remote coro_rpc receiver. Its runtime aggregates whatever is reported.
+    // The SubMaster-side CFM component (embedded mode) or the ownership
+    // resolver used by the remote reporter.
     std::shared_ptr<CfmService> embedded_service;
-    std::shared_ptr<CfmRpcTransport> transport;
     std::shared_ptr<IoPatternRuntime> cfm_runtime;
+    std::shared_ptr<CfmOwnershipClient> ownership_client;
+    std::shared_ptr<CfmRpcChannel> embedded_channel;
+    std::string deployment_description;
     if (FLAGS_cfm_endpoint.empty()) {
+        deployment_description = "embedded SubMaster (local CFM)";
         cfm_runtime = std::make_shared<IoPatternRuntime>(
             IoPatternRuntime::Handlers{
                 .eviction = [&eviction_commands](const EvictionPlan&) {
@@ -349,33 +529,43 @@ int main(int argc, char* argv[]) {
                     return ErrorCode::OK;
                 }});
         embedded_service = std::make_shared<CfmService>(cfm_runtime);
-        transport = std::make_shared<EmbeddedCfmTransport>(embedded_service);
+        auto transport =
+            std::make_shared<EmbeddedCfmTransport>(embedded_service);
+        embedded_channel = std::make_shared<CfmRpcChannel>(
+            std::move(transport), std::make_shared<CfmBinaryCodec>(),
+            CfmRpcConfig{.timeout = std::chrono::milliseconds(500)});
     } else {
-        transport = std::make_shared<CoroRpcCfmTransport>(
-            FLAGS_cfm_endpoint, std::chrono::milliseconds(500));
+        const auto resolver = ResolveCfmEndpointOwnership();
+        ownership_client =
+            std::make_shared<CfmOwnershipClient>(resolver, std::chrono::milliseconds(500));
+        deployment_description = "remote SubMaster(s) via CFM coro_rpc";
     }
-
-    auto codec = std::make_shared<CfmBinaryCodec>();
-    auto channel = std::make_shared<CfmRpcChannel>(
-        transport, codec,
-        CfmRpcConfig{.timeout = std::chrono::milliseconds(500)});
 
     IoPatternRuntime::Config source_config;
     source_config.report_capacity = FLAGS_report_capacity;
     MetricReportStats metric_reports;
-    source_config.report_sink = [&channel, &metric_reports](const MetricBatch& batch) {
+    const auto report_metric_batch = [&](const MetricBatch& batch) -> bool {
         const auto started = Clock::now();
-        const bool success = channel->SendMetricBatch(batch);
+        const bool success =
+            ownership_client ? ownership_client->ReportMetricBatch(batch) == ErrorCode::OK
+                             : (embedded_channel && embedded_channel->SendMetricBatch(batch));
         metric_reports.Record(batch, ToMicroseconds(Clock::now() - started),
                               success);
         return success;
     };
+    source_config.report_sink = report_metric_batch;
     auto source_runtime = std::make_shared<IoPatternRuntime>(
         IoPatternRuntime::Handlers{
             .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
             .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
             .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
         source_config);
+
+    const auto send_snapshot = [&](const IoPatternSnapshot& snapshot) -> bool {
+        return ownership_client
+                   ? ownership_client->ReportSnapshot(snapshot) == ErrorCode::OK
+                   : (embedded_channel && embedded_channel->SendSnapshot(snapshot));
+    };
 
     LatencyStats report_latency;
     uint64_t failed_reports = 0;
@@ -393,7 +583,7 @@ int main(int argc, char* argv[]) {
         source_runtime->RecordStorageMetric(request.snapshot.storage.front());
 
         const auto report_start = Clock::now();
-        const bool sent = channel->SendSnapshot(request.snapshot);
+        const bool sent = send_snapshot(request.snapshot);
         report_latency.Record(ToMicroseconds(Clock::now() - report_start));
         if (!sent) ++failed_reports;
     }
@@ -441,10 +631,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\n============================================================\n"
               << "CFM CLIENT BENCHMARK (vLLM inference request model)\n"
               << "============================================================\n"
-              << "  CFM deployment:          "
-              << (embedded_service ? "embedded SubMaster (local CFM)"
-                                   : "remote SubMaster coro_rpc endpoint")
-              << "\n"
+              << "  CFM deployment:          " << deployment_description << "\n"
               << "  Requests:                " << FLAGS_requests << "\n"
               << "  Tokens/request:          "
               << FLAGS_prompt_tokens + FLAGS_output_tokens << " (prompt="
