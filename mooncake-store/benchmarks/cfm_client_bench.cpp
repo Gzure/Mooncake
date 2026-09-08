@@ -1,10 +1,21 @@
-// CFM client benchmark that models the vLLM KV-cache call path.
+// CFM benchmark that models the vLLM KV-cache call path in the embedded CFM
+// architecture.
 //
-// One benchmark request consists of prompt_tokens + output_tokens. The KV
-// cache is split into tokens_per_block blocks for every transformer layer,
-// exactly as a vLLM connector would address its layer/block cache entries.
-// Each request records inference and access metrics, reports a snapshot through
-// CfmClientImpl, then prints both CFM call latency and IO Pattern metrics.
+// CFM is a component of every SubMaster; there is no standalone CFM Master and
+// no credential. A reporting client observes keys (KV blocks) and sends metric
+// batches over the SubMaster's regular coro_rpc endpoint. The SubMaster merges
+// reports into its local runtime, then policy evaluation and execution run
+// locally on the keys it owns (high-watermark eviction in the data path,
+// trace-derived prefetch through the same storage-safe handlers).
+//
+// This benchmark exercises that path in two modes:
+//   - embedded (default): an in-process SubMaster runtime plays the owning
+//     CFM component. Reports are delivered in-process and policy is evaluated
+//     and executed locally, so the benchmark prints both report latency and
+//     the resulting eviction/prefetch/admission handler activity.
+//   - remote (--cfm_endpoint=host:port): reports go over coro_rpc to a real
+//     SubMaster CFM receiver; the receiving side is not observable here, so
+//     only client-side latency is reported.
 
 #include <algorithm>
 #include <atomic>
@@ -25,7 +36,6 @@
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
-#include "io_pattern/cfm_client_impl.h"
 #include "io_pattern/cfm_protocol.h"
 #include "io_pattern/cfm_service.h"
 #include "io_pattern/rpc_transport.h"
@@ -50,18 +60,16 @@ DEFINE_uint64(shared_prefix_tokens, 512,
               "Per-session prompt prefix reused by later requests");
 DEFINE_uint64(report_capacity, 262144,
               "Maximum queued IO Pattern observations before reporting");
-DEFINE_uint64(policy_queue_capacity, 4096,
-              "Maximum CFM policy commands queued for the client");
 DEFINE_uint64(report_flush_wait_ms, 1100,
-              "Maximum wait for remote CFM policy production after a flush");
+              "Grace period for report drain before local policy evaluation");
 DEFINE_double(memory_used_ratio, 0.95,
-              "Reported L1 memory use ratio; >= 0.90 triggers CFM planning");
+              "Reported L1 memory use ratio; >= 0.90 triggers eviction");
 DEFINE_string(tenant, "vllm-benchmark", "Tenant id");
-DEFINE_string(node_id, "vllm-submaster-0", "CFM node/submaster id");
+DEFINE_string(node_id, "vllm-submaster-0",
+              "CFM node/submaster id that owns the reported keys");
 DEFINE_string(cfm_endpoint, "",
-              "Remote CFM coro_rpc endpoint; empty uses an embedded CFM service");
-DEFINE_string(cfm_auth_token, "cfm-client-benchmark-node-token",
-              "Authentication token for the CFM node endpoint");
+              "Remote SubMaster coro_rpc endpoint (host:port); empty uses an "
+              "embedded in-process SubMaster CFM component");
 
 uint64_t SteadyNowNs() {
     return static_cast<uint64_t>(
@@ -89,48 +97,21 @@ std::string KvKey(size_t session, size_t request, size_t layer, size_t block,
            std::to_string(layer) + "/block-" + std::to_string(block);
 }
 
-class ServiceBackedCfmTransport final : public CfmRpcTransport {
+// Sends reports straight into an embedded SubMaster's CFM component. This is
+// the ownership-addressed path collapsed to the single owning SubMaster of a
+// benchmark run, exercised without network.
+class EmbeddedCfmTransport final : public CfmRpcTransport {
    public:
-    ServiceBackedCfmTransport(std::shared_ptr<CfmService> service,
-                              std::string node_id)
-        : service_(std::move(service)), node_id_(std::move(node_id)) {}
-
-    bool Authenticate(std::string_view token) override {
-        if (!service_ || !service_->AuthenticateNode(token)) return false;
-        token_ = std::string(token);
-        authenticated_ = true;
-        return true;
-    }
+    explicit EmbeddedCfmTransport(std::shared_ptr<CfmService> service)
+        : service_(std::move(service)) {}
 
     bool Send(std::string_view method, std::string_view payload,
               std::chrono::milliseconds) override {
-        return authenticated_ && service_ &&
-               service_->Send(node_id_, method, payload, token_);
-    }
-
-    CfmReceiveResult Receive(std::string_view method,
-                             std::chrono::milliseconds) override {
-        if (!authenticated_ || !service_ || method != "poll_policy") {
-            return CfmReceiveResult::Error();
-        }
-        const auto delivery = service_->PollPolicy(node_id_, token_);
-        return delivery
-                   ? CfmReceiveResult::Payload(delivery->second, delivery->first)
-                   : CfmReceiveResult::Empty();
-    }
-
-    bool Acknowledge(uint64_t delivery_id, bool success,
-                     std::chrono::milliseconds) override {
-        return authenticated_ && service_ &&
-               service_->AcknowledgePolicy(node_id_, delivery_id, success,
-                                           token_);
+        return service_ && service_->Send(method, payload, FLAGS_node_id);
     }
 
    private:
     std::shared_ptr<CfmService> service_;
-    std::string node_id_;
-    std::string token_;
-    bool authenticated_{false};
 };
 
 class LatencyStats final {
@@ -328,8 +309,8 @@ bool ValidateFlags() {
     return FLAGS_requests != 0 && FLAGS_prompt_tokens + FLAGS_output_tokens != 0 &&
            FLAGS_tokens_per_block != 0 && FLAGS_num_layers != 0 &&
            FLAGS_kv_block_bytes != 0 && FLAGS_num_sessions != 0 &&
-           FLAGS_report_capacity != 0 && FLAGS_policy_queue_capacity != 0 &&
-           FLAGS_memory_used_ratio >= 0.0 && FLAGS_memory_used_ratio <= 1.0;
+           FLAGS_report_capacity != 0 && FLAGS_memory_used_ratio >= 0.0 &&
+           FLAGS_memory_used_ratio <= 1.0;
 }
 
 }  // namespace
@@ -343,35 +324,41 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    constexpr char kProducerToken[] = "cfm-client-benchmark-producer-token";
     std::atomic<uint64_t> eviction_commands{0};
     std::atomic<uint64_t> prefetch_commands{0};
     std::atomic<uint64_t> admission_commands{0};
 
+    // The SubMaster-side CFM component (embedded mode) or the target of the
+    // remote coro_rpc receiver. Its runtime aggregates whatever is reported.
     std::shared_ptr<CfmService> embedded_service;
     std::shared_ptr<CfmRpcTransport> transport;
+    std::shared_ptr<IoPatternRuntime> cfm_runtime;
     if (FLAGS_cfm_endpoint.empty()) {
-        auto cfm_control_runtime = std::make_shared<IoPatternRuntime>(
+        cfm_runtime = std::make_shared<IoPatternRuntime>(
             IoPatternRuntime::Handlers{
-                .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
-                .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
-                .admission = [](const AdmissionResult&) {
+                .eviction = [&eviction_commands](const EvictionPlan&) {
+                    ++eviction_commands;
+                    return ErrorCode::OK;
+                },
+                .prefetch = [&prefetch_commands](const PrefetchPlan&) {
+                    ++prefetch_commands;
+                    return ErrorCode::OK;
+                },
+                .admission = [&admission_commands](const AdmissionResult&) {
+                    ++admission_commands;
                     return ErrorCode::OK;
                 }});
-        embedded_service = std::make_shared<CfmService>(
-            cfm_control_runtime, FLAGS_cfm_auth_token,
-            FLAGS_policy_queue_capacity, kProducerToken);
-        transport = std::make_shared<ServiceBackedCfmTransport>(
-            embedded_service, FLAGS_node_id);
+        embedded_service = std::make_shared<CfmService>(cfm_runtime);
+        transport = std::make_shared<EmbeddedCfmTransport>(embedded_service);
     } else {
         transport = std::make_shared<CoroRpcCfmTransport>(
-            FLAGS_cfm_endpoint, FLAGS_node_id, std::chrono::milliseconds(500));
+            FLAGS_cfm_endpoint, std::chrono::milliseconds(500));
     }
+
     auto codec = std::make_shared<CfmBinaryCodec>();
     auto channel = std::make_shared<CfmRpcChannel>(
         transport, codec,
-        CfmRpcConfig{.timeout = std::chrono::milliseconds(500),
-                     .auth_token = FLAGS_cfm_auth_token});
+        CfmRpcConfig{.timeout = std::chrono::milliseconds(500)});
 
     IoPatternRuntime::Config source_config;
     source_config.report_capacity = FLAGS_report_capacity;
@@ -385,22 +372,10 @@ int main(int argc, char* argv[]) {
     };
     auto source_runtime = std::make_shared<IoPatternRuntime>(
         IoPatternRuntime::Handlers{
-            .eviction = [&eviction_commands](const EvictionPlan&) {
-                ++eviction_commands;
-                return ErrorCode::OK;
-            },
-            .prefetch = [&prefetch_commands](const PrefetchPlan&) {
-                ++prefetch_commands;
-                return ErrorCode::OK;
-            },
-            .admission = [&admission_commands](const AdmissionResult&) {
-                ++admission_commands;
-                return ErrorCode::OK;
-            }},
+            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
         source_config);
-    CfmClientImpl client(channel, [&source_runtime](const PolicyCommand& command) {
-        return source_runtime->ExecuteCommand(command);
-    });
 
     LatencyStats report_latency;
     uint64_t failed_reports = 0;
@@ -418,40 +393,34 @@ int main(int argc, char* argv[]) {
         source_runtime->RecordStorageMetric(request.snapshot.storage.front());
 
         const auto report_start = Clock::now();
-        const auto result = client.ReportSnapshot(request.snapshot);
+        const bool sent = channel->SendSnapshot(request.snapshot);
         report_latency.Record(ToMicroseconds(Clock::now() - report_start));
-        if (result != ErrorCode::OK) ++failed_reports;
+        if (!sent) ++failed_reports;
     }
     const auto submission_seconds =
         std::chrono::duration<double>(Clock::now() - benchmark_start).count();
 
     // Stop joins the reporter worker and performs its final flush. No new
-    // metric batch can reach CFM after this returns.
+    // metric batch can reach the SubMaster after this returns.
     source_runtime->StopReports();
-    if (embedded_service) {
-        if (!embedded_service->WaitForPolicyIdle(
-                std::chrono::milliseconds(FLAGS_report_flush_wait_ms))) {
-            LOG(WARNING) << "Timed out waiting for embedded CFM policy production";
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(FLAGS_report_flush_wait_ms));
+
+    // Embedded mode: evaluate and execute policy locally on the SubMaster
+    // runtime, exactly as the data-path high-watermark trigger does in
+    // production. The merged report above is what feeds that evaluation.
+    if (cfm_runtime && !cfm_runtime->Snapshot().keys.empty()) {
+        const auto capacity = 1024ULL * 1024 * 1024;
+        const auto target =
+            static_cast<uint64_t>((FLAGS_memory_used_ratio - 0.80F) *
+                                  static_cast<float>(capacity));
+        const auto status = cfm_runtime->Execute(
+            CacheTier::kL1Host,
+            target > 0 ? target : capacity / 10, TraceHistory{});
+        if (status.eviction != ErrorCode::OK &&
+            status.prefetch != ErrorCode::OK && status.degraded) {
+            LOG(WARNING) << "Local CFM evaluation degraded";
         }
-    } else {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(FLAGS_report_flush_wait_ms));
-    }
-    uint64_t observed_commands = 0;
-    bool policy_drain_complete = false;
-    const auto policy_deadline =
-        Clock::now() + std::chrono::milliseconds(FLAGS_report_flush_wait_ms);
-    while (Clock::now() < policy_deadline) {
-        if (client.PollAndDispatchPolicy() != ErrorCode::OK) break;
-        const uint64_t executed = eviction_commands + prefetch_commands +
-                                  admission_commands;
-        if (executed == observed_commands) {
-            policy_drain_complete = embedded_service != nullptr;
-            break;
-        } else {
-            observed_commands = executed;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     const auto end_to_end_seconds =
@@ -463,17 +432,19 @@ int main(int argc, char* argv[]) {
     source_runtime.reset();
     report_latency.Finalize();
     const auto metric_report_snapshot = metric_reports.Finalize();
-    const auto cfm_snapshot = embedded_service
-                                  ? embedded_service->SnapshotForNode(FLAGS_node_id)
-                                  : IoPatternSnapshot{};
-    const auto cfm_metrics = embedded_service
-                                 ? embedded_service->ObservabilityForNode(
-                                       FLAGS_node_id, end_to_end_seconds)
-                                 : IoPatternObservabilitySnapshot{};
+    const auto cfm_snapshot =
+        embedded_service ? embedded_service->Snapshot() : IoPatternSnapshot{};
+    const auto cfm_metrics =
+        embedded_service ? embedded_service->Observability(end_to_end_seconds)
+                         : IoPatternObservabilitySnapshot{};
 
     std::cout << "\n============================================================\n"
               << "CFM CLIENT BENCHMARK (vLLM inference request model)\n"
               << "============================================================\n"
+              << "  CFM deployment:          "
+              << (embedded_service ? "embedded SubMaster (local CFM)"
+                                   : "remote SubMaster coro_rpc endpoint")
+              << "\n"
               << "  Requests:                " << FLAGS_requests << "\n"
               << "  Tokens/request:          "
               << FLAGS_prompt_tokens + FLAGS_output_tokens << " (prompt="
@@ -488,7 +459,7 @@ int main(int argc, char* argv[]) {
               << "  Submission requests/sec: "
               << FLAGS_requests / submission_seconds << "\n"
               << "  End-to-end time:         " << end_to_end_seconds << " s\n"
-              << "\n  CFM ReportSnapshot latency\n"
+              << "\n  CFM SendSnapshot latency\n"
               << "    failed reports:        " << failed_reports << "\n"
               << "    mean:                  " << report_latency.Mean() << " us\n"
               << "    p50 / p90 / p99:       " << report_latency.Percentile(50)
@@ -507,15 +478,10 @@ int main(int argc, char* argv[]) {
               << metric_report_snapshot.latency.Percentile(50) << " / "
               << metric_report_snapshot.latency.Percentile(90) << " / "
               << metric_report_snapshot.latency.Percentile(99) << " us\n"
-              << "\n  CFM policy commands executed\n"
+              << "\n  Local policy handlers executed\n"
               << "    evictions:             " << eviction_commands << "\n"
               << "    prefetches:            " << prefetch_commands << "\n"
               << "    admissions:            " << admission_commands << "\n"
-              << "    policy drain:          "
-              << (embedded_service
-                      ? (policy_drain_complete ? "complete" : "timed out/error")
-                      : "remote endpoint is not verifiable")
-              << "\n"
               << "\n  IO Pattern snapshots\n"
               << "    client keys / storage: " << source_snapshot.keys.size() << " / "
               << source_snapshot.storage.size() << "\n";

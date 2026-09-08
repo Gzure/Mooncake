@@ -1,11 +1,10 @@
 #pragma once
 
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <string>
 #include <string_view>
 #include <functional>
@@ -17,23 +16,6 @@
 
 namespace mooncake::io_pattern {
 
-struct CfmReceiveResult {
-    enum class Status { kPayload, kEmpty, kError };
-
-    static CfmReceiveResult Payload(std::string payload,
-                                    uint64_t delivery_id = 0) {
-        return {.status = Status::kPayload,
-                .payload = std::move(payload),
-                .delivery_id = delivery_id};
-    }
-    static CfmReceiveResult Empty() { return {.status = Status::kEmpty}; }
-    static CfmReceiveResult Error() { return {.status = Status::kError}; }
-
-    Status status{Status::kEmpty};
-    std::string payload;
-    uint64_t delivery_id{0};
-};
-
 class CfmRpcCodec {
    public:
     virtual ~CfmRpcCodec() = default;
@@ -44,39 +26,32 @@ class CfmRpcCodec {
         const std::string&) const = 0;
 };
 
+// Transport for CFM reports addressed to the SubMaster that owns the reported
+// keys. There is no authentication: Mooncake RPCs run inside the trusted
+// deployment, and CFM is an embedded component of every SubMaster reached over
+// its regular coro_rpc endpoint (the same endpoint all other Mooncake APIs
+// use). Only method/payload delivery is needed because the receiver merges
+// reports into its local runtime instead of maintaining per-node policy
+// queues.
 class CfmRpcTransport {
    public:
     virtual ~CfmRpcTransport() = default;
-    // Implementations that communicate with a remote CFM should override this
-    // to bind the connection to the configured service credential. Keeping a
-    // default preserves compatibility with trusted in-process transports.
-    virtual bool Authenticate(std::string_view token) { return token.empty(); }
     virtual bool Send(std::string_view method, std::string_view payload,
                       std::chrono::milliseconds timeout) = 0;
-    virtual CfmReceiveResult Receive(
-        std::string_view method, std::chrono::milliseconds timeout) = 0;
-    virtual bool Acknowledge(uint64_t delivery_id, bool success,
-                             std::chrono::milliseconds timeout) = 0;
 };
 
 // Production CFM transport over Mooncake's existing coro_rpc connection pool.
-// It targets the CFM handlers registered on the Master RPC service.
+// It targets the CFM handler registered on the Master RPC service of the
+// SubMaster that owns the reported keys.
 class CoroRpcCfmTransport final : public CfmRpcTransport {
    public:
-    CoroRpcCfmTransport(std::string endpoint, std::string node_id,
+    CoroRpcCfmTransport(std::string endpoint,
                         std::chrono::milliseconds default_timeout =
                             std::chrono::milliseconds(500));
     ~CoroRpcCfmTransport() override;
 
-    bool Authenticate(std::string_view token) override;
     bool Send(std::string_view method, std::string_view payload,
               std::chrono::milliseconds timeout) override;
-    CfmReceiveResult Receive(
-        std::string_view method, std::chrono::milliseconds timeout) override;
-    bool Acknowledge(uint64_t delivery_id, bool success,
-                     std::chrono::milliseconds timeout) override;
-    bool EnqueuePolicy(std::string_view node_id, std::string_view payload,
-                       std::chrono::milliseconds timeout);
 
    private:
     class Impl;
@@ -85,39 +60,26 @@ class CoroRpcCfmTransport final : public CfmRpcTransport {
 
 struct CfmRpcConfig {
     std::chrono::milliseconds timeout{500};
-    std::string auth_token;
 };
 
-// A concrete authenticated endpoint for embedded deployments and integration
-// tests. It is intentionally transport-agnostic at the codec boundary: a
+// An in-process CFM endpoint for embedded deployments and integration tests.
+// It is intentionally transport-agnostic at the codec boundary: a
 // socket/HTTP implementation can expose the same method names and wire bytes.
 class InProcessCfmRpcTransport final : public CfmRpcTransport {
    public:
     using SendHandler = std::function<bool(std::string_view, std::string_view)>;
 
-    explicit InProcessCfmRpcTransport(std::string auth_token,
-                                      SendHandler send_handler = {})
-        : auth_token_(std::move(auth_token)), send_handler_(std::move(send_handler)) {}
+    explicit InProcessCfmRpcTransport(SendHandler send_handler = {})
+        : send_handler_(std::move(send_handler)) {}
 
-    bool Authenticate(std::string_view token) override;
     bool Send(std::string_view method, std::string_view payload,
-              std::chrono::milliseconds timeout) override;
-    CfmReceiveResult Receive(
-        std::string_view method, std::chrono::milliseconds timeout) override;
-    bool Acknowledge(uint64_t, bool,
-                     std::chrono::milliseconds) override {
-        return true;
-    }
+              std::chrono::milliseconds) override;
 
-    void EnqueuePolicy(std::string payload);
     void SetSendHandler(SendHandler handler);
 
    private:
     mutable std::mutex mutex_;
-    const std::string auth_token_;
-    bool authenticated_{false};
     SendHandler send_handler_;
-    std::queue<std::string> policies_;
 };
 
 class CfmRpcChannel final : public CfmChannel {
@@ -130,32 +92,25 @@ class CfmRpcChannel final : public CfmChannel {
           config_(config) {}
 
     bool SendSnapshot(const IoPatternSnapshot& snapshot) override;
-    CfmPollResult PollPolicyResult() override;
-    bool AcknowledgePolicy(uint64_t delivery_id, bool success) override;
+    bool SendMetricBatch(const MetricBatch& batch) override;
     ErrorCode ExecutePrefetch(const PrefetchPlan& plan) override;
-    bool SendMetricBatch(const MetricBatch& batch);
 
    private:
-    bool EnsureAuthenticated();
-
     std::shared_ptr<CfmRpcTransport> transport_;
     std::shared_ptr<CfmRpcCodec> codec_;
     CfmRpcConfig config_;
-    std::mutex authentication_mutex_;
-    bool authenticated_{false};
 };
 
-// Reuses a bounded set of authenticated CFM channels. Requests are selected
-// round-robin; an unavailable member is skipped so one failed connection does
-// not stall policy reporting.
+// Reuses a bounded set of CFM channels. Requests are selected round-robin; an
+// unavailable member is skipped so one failed connection does not stall
+// metric reporting.
 class CfmChannelPool final : public CfmChannel {
    public:
     explicit CfmChannelPool(std::vector<std::shared_ptr<CfmChannel>> channels)
         : channels_(std::move(channels)) {}
 
     bool SendSnapshot(const IoPatternSnapshot& snapshot) override;
-    CfmPollResult PollPolicyResult() override;
-    bool AcknowledgePolicy(uint64_t delivery_id, bool success) override;
+    bool SendMetricBatch(const MetricBatch& batch) override;
     ErrorCode ExecutePrefetch(const PrefetchPlan& plan) override;
 
    private:

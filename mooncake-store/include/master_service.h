@@ -53,8 +53,6 @@
 namespace mooncake {
 
 namespace io_pattern {
-class CfmChannel;
-class CfmClientImpl;
 class CfmService;
 class IoPatternRuntime;
 }
@@ -2224,14 +2222,12 @@ class MasterService {
     // The IO-pattern pipeline is deliberately owned by MasterService: the
     // master has the authoritative replica map and is the only component that
     // can safely translate a policy plan into promotion/eviction operations.
+    // CFM is embedded here as a component of this SubMaster: reports addressed
+    // to the keys this master owns are merged into the local runtime over the
+    // regular coro_rpc endpoint, so no remote reporting channel, policy poller
+    // or credential is needed.
     std::shared_ptr<io_pattern::IoPatternRuntime> io_pattern_runtime_;
     std::shared_ptr<io_pattern::CfmService> io_pattern_cfm_service_;
-    std::shared_ptr<io_pattern::CfmChannel> io_pattern_cfm_channel_;
-    std::unique_ptr<io_pattern::CfmClientImpl> io_pattern_cfm_client_;
-    std::atomic<bool> io_pattern_cfm_polling_{false};
-    std::mutex io_pattern_cfm_poll_mutex_;
-    std::condition_variable io_pattern_cfm_poll_cv_;
-    std::thread io_pattern_cfm_poll_thread_;
 
     const std::string ha_backend_type_;
 

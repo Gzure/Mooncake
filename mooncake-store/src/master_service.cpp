@@ -60,11 +60,7 @@
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
 #include "io_pattern/runtime.h"
-#include "io_pattern/cfm_client_impl.h"
-#include "io_pattern/cfm_protocol.h"
 #include "io_pattern/cfm_service.h"
-#include "io_pattern/resilient_cfm_channel.h"
-#include "io_pattern/rpc_transport.h"
 
 namespace mooncake {
 
@@ -442,48 +438,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     io_pattern::IoPatternRuntime::Config io_pattern_config;
-    std::shared_ptr<io_pattern::CfmRpcChannel> cfm_rpc_channel;
-    if (!config.io_pattern_cfm.endpoint.empty()) {
-        if (config.io_pattern_cfm.timeout_ms == 0 ||
-            config.io_pattern_cfm.timeout_ms > 10'000) {
-            throw std::invalid_argument(
-                "io_pattern_cfm_timeout_ms must be in [1, 10000]");
-        }
-        if (config.io_pattern_cfm.auth_token.empty()) {
-            throw std::invalid_argument(
-                "io_pattern_cfm_auth_token is required when "
-                "io_pattern_cfm_endpoint is configured");
-        }
-        // In CVM mode every SubMaster owns a different slot set. Use the
-        // stable SubMaster id by default so CFM keeps their reports and
-        // policy queues separate; cluster_id is only a legacy fallback.
-        const std::string node_id =
-            config.io_pattern_cfm.node_id.empty()
-                ? (config.master_id.empty() ? config.cluster_id
-                                            : config.master_id)
-                : config.io_pattern_cfm.node_id;
-        auto transport = std::make_shared<io_pattern::CoroRpcCfmTransport>(
-            config.io_pattern_cfm.endpoint, node_id,
-            std::chrono::milliseconds(config.io_pattern_cfm.timeout_ms));
-        if (!transport->Authenticate(config.io_pattern_cfm.auth_token)) {
-            throw std::runtime_error(
-                "failed to authenticate with configured IO-pattern CFM "
-                "endpoint " +
-                config.io_pattern_cfm.endpoint);
-        }
-        cfm_rpc_channel = std::make_shared<io_pattern::CfmRpcChannel>(
-            std::move(transport),
-            std::make_shared<io_pattern::CfmBinaryCodec>(),
-            io_pattern::CfmRpcConfig{
-                .timeout =
-                    std::chrono::milliseconds(config.io_pattern_cfm.timeout_ms),
-                .auth_token = config.io_pattern_cfm.auth_token});
-        io_pattern_config.report_sink =
-            io_pattern::MakeCfmMetricBatchSink(cfm_rpc_channel);
-        io_pattern_cfm_channel_ =
-            std::make_shared<io_pattern::ResilientCfmChannel>(cfm_rpc_channel);
-    }
-
     io_pattern_runtime_ = std::make_shared<io_pattern::IoPatternRuntime>(
         io_pattern::IoPatternRuntime::Handlers{
             .eviction =
@@ -552,9 +506,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 }},
         std::move(io_pattern_config));
     io_pattern_cfm_service_ = std::make_shared<io_pattern::CfmService>(
-        io_pattern_runtime_, config.io_pattern_cfm.auth_token,
-        config.io_pattern_cfm.policy_queue_capacity,
-        config.io_pattern_cfm.producer_auth_token);
+        io_pattern_runtime_);
 
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
@@ -683,34 +635,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (vchunk_enabled_ && !vchunk_recovery_pending_) {
         StartVChunkReaper();
-    }
-
-    // Start the CFM consumer last. If any preceding initialization throws,
-    // constructor unwinding must not encounter a joinable std::thread.
-    if (io_pattern_cfm_channel_) {
-        io_pattern_cfm_client_ = std::make_unique<io_pattern::CfmClientImpl>(
-            io_pattern_cfm_channel_,
-            [this](const io_pattern::PolicyCommand& command) {
-                return io_pattern_runtime_
-                           ? io_pattern_runtime_->ExecuteCommand(command)
-                           : ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
-            });
-        io_pattern_cfm_polling_ = true;
-        io_pattern_cfm_poll_thread_ = std::thread([this] {
-            while (io_pattern_cfm_polling_.load(std::memory_order_acquire)) {
-                const auto result =
-                    io_pattern_cfm_client_->PollAndDispatchPolicy();
-                std::unique_lock lock(io_pattern_cfm_poll_mutex_);
-                io_pattern_cfm_poll_cv_.wait_for(
-                    lock,
-                    result == ErrorCode::OK ? std::chrono::milliseconds(100)
-                                            : std::chrono::seconds(1),
-                    [this] {
-                        return !io_pattern_cfm_polling_.load(
-                            std::memory_order_acquire);
-                    });
-            }
-        });
     }
 }
 
@@ -1726,14 +1650,6 @@ bool MasterService::OwnsVChunkSlot(uint16_t slot) const {
 }
 
 MasterService::~MasterService() {
-    io_pattern_cfm_polling_.store(false, std::memory_order_release);
-    io_pattern_cfm_poll_cv_.notify_all();
-    if (io_pattern_cfm_poll_thread_.joinable()) {
-        io_pattern_cfm_poll_thread_.join();
-    }
-    io_pattern_cfm_client_.reset();
-    io_pattern_cfm_channel_.reset();
-
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();
     }

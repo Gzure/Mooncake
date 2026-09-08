@@ -22,31 +22,8 @@ bool ResilientCfmChannel::SendSnapshot(const IoPatternSnapshot& snapshot) {
     return Retry([&] { return delegate_->SendSnapshot(snapshot); });
 }
 
-CfmPollResult ResilientCfmChannel::PollPolicyResult() {
-    if (!delegate_) {
-        RecordFailure();
-        return CfmPollResult::Error();
-    }
-    for (uint32_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
-        auto result = delegate_->PollPolicyResult();
-        if (result.status == CfmPollResult::Status::kCommand) {
-            RecordSuccess();
-            return result;
-        }
-        if (result.status == CfmPollResult::Status::kEmpty) {
-            RecordSuccess();
-            return result;
-        }
-    }
-    RecordFailure();
-    return CfmPollResult::Error();
-}
-
-bool ResilientCfmChannel::AcknowledgePolicy(uint64_t delivery_id,
-                                            bool success) {
-    return Retry([&] {
-        return delegate_->AcknowledgePolicy(delivery_id, success);
-    });
+bool ResilientCfmChannel::SendMetricBatch(const MetricBatch& batch) {
+    return Retry([&] { return delegate_->SendMetricBatch(batch); });
 }
 
 ErrorCode ResilientCfmChannel::ExecutePrefetch(const PrefetchPlan& plan) {

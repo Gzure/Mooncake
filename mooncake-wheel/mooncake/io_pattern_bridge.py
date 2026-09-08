@@ -1,5 +1,12 @@
 """Framework-neutral, non-blocking CFM metric bridges.
 
+CFM is an embedded component of every SubMaster and is reached over the
+SubMaster's ordinary Mooncake RPC endpoint; there is no separate CFM Master
+endpoint and no auth token to obtain. A deployment wires ``report`` to a
+client that resolves the owning SubMaster of each observed key through the CVM
+mapping, aggregates observations per SubMaster, and delivers them to that
+SubMaster's CFM receiver.
+
 The vLLM connector accepts these objects through ``vllm_config``.  SGLang's
 HiCache integration can instantiate :class:`SglangHiCacheIoPatternBridge` at
 its request-finished and prefix-match hooks without depending on vLLM.
@@ -19,8 +26,9 @@ MetricSink = Callable[[Mapping[str, Any]], None]
 class BatchedIoPatternBridge:
     """Bounded asynchronous bridge to a CFM metric reporter.
 
-    ``report`` receives complete records (for example, a CFM RPC client
-    method).  Back pressure drops metrics instead of delaying inference.
+    ``report`` receives complete records (for example, a CVM ownership-aware
+    CFM client method such as ``CfmOwnershipClient.ReportMetricBatch``).
+    Back pressure drops metrics instead of delaying inference.
     """
 
     def __init__(self, report: MetricSink, capacity: int = 4096) -> None:

@@ -113,26 +113,18 @@ class TestCfmChannel final : public CfmChannel {
         snapshot = value;
         return send_ok;
     }
-    CfmPollResult PollPolicyResult() override {
-        return policy ? CfmPollResult::Command(*policy, 42)
-                      : CfmPollResult::Empty();
-    }
-    bool AcknowledgePolicy(uint64_t delivery_id, bool success) override {
-        acknowledged_delivery_id = delivery_id;
-        acknowledged_success = success;
-        return acknowledge_ok;
+    bool SendMetricBatch(const MetricBatch& value) override {
+        batch = value;
+        return send_ok;
     }
     ErrorCode ExecutePrefetch(const PrefetchPlan& value) override {
         plan = value;
         return execute_code;
     }
     bool send_ok{true};
-    bool acknowledge_ok{true};
-    bool acknowledged_success{false};
-    uint64_t acknowledged_delivery_id{0};
     ErrorCode execute_code{ErrorCode::OK};
     IoPatternSnapshot snapshot;
-    std::optional<PolicyCommand> policy;
+    MetricBatch batch;
     PrefetchPlan plan;
 };
 
@@ -141,8 +133,8 @@ class FlakyCfmChannel final : public CfmChannel {
     bool SendSnapshot(const IoPatternSnapshot&) override {
         return send_failures-- <= 0;
     }
-    CfmPollResult PollPolicyResult() override {
-        return CfmPollResult::Command(PrefetchPlan{});
+    bool SendMetricBatch(const MetricBatch&) override {
+        return send_failures-- <= 0;
     }
     ErrorCode ExecutePrefetch(const PrefetchPlan&) override {
         return ErrorCode::RPC_FAIL;
@@ -159,25 +151,7 @@ class TestRpcTransport final : public CfmRpcTransport {
         last_timeout = timeout;
         return send_ok;
     }
-    CfmReceiveResult Receive(std::string_view method,
-                             std::chrono::milliseconds timeout) override {
-        last_method = std::string(method);
-        last_timeout = timeout;
-        return response ? CfmReceiveResult::Payload(*response)
-                        : CfmReceiveResult::Empty();
-    }
-    bool Acknowledge(uint64_t delivery_id, bool success,
-                     std::chrono::milliseconds timeout) override {
-        acknowledged_delivery_id = delivery_id;
-        acknowledged_success = success;
-        last_timeout = timeout;
-        return acknowledge_ok;
-    }
     bool send_ok{true};
-    bool acknowledge_ok{true};
-    bool acknowledged_success{false};
-    uint64_t acknowledged_delivery_id{0};
-    std::optional<std::string> response;
     std::string last_method;
     std::string last_payload;
     std::chrono::milliseconds last_timeout{0};
@@ -803,35 +777,19 @@ TEST(IoPatternFrameworkTest, CfmClientDelegatesToTransportChannel) {
     snapshot.generated_at_ns = 42;
     EXPECT_EQ(client.ReportSnapshot(snapshot), ErrorCode::OK);
     EXPECT_EQ(channel->snapshot.generated_at_ns, 42);
-    channel->policy = PrefetchPlan{};
-    EXPECT_TRUE(client.PollPolicy().has_value());
     EXPECT_EQ(client.ExecutePrefetch(PrefetchPlan{}), ErrorCode::OK);
+    MetricBatch batch;
+    batch.inference.push_back(InferenceMetrics{});
+    EXPECT_EQ(client.ReportMetricBatch(batch), ErrorCode::OK);
+    EXPECT_EQ(channel->batch.inference.size(), 1);
     channel->send_ok = false;
     EXPECT_EQ(client.ReportSnapshot(snapshot), ErrorCode::RPC_FAIL);
+    EXPECT_EQ(client.ReportMetricBatch(batch), ErrorCode::RPC_FAIL);
     CfmClientImpl unavailable(nullptr);
     EXPECT_EQ(unavailable.ReportSnapshot(snapshot),
               ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-}
-
-TEST(IoPatternFrameworkTest, CfmClientDispatchesReceivedPolicyCommands) {
-    auto channel = std::make_shared<TestCfmChannel>();
-    int dispatched = 0;
-    CfmClientImpl client(channel, [&](const PolicyCommand& command) {
-        EXPECT_TRUE(std::holds_alternative<PrefetchPlan>(command));
-        ++dispatched;
-        return ErrorCode::OK;
-    });
-
-    EXPECT_EQ(client.ReceivePolicy(PolicyCommand{PrefetchPlan{}}), ErrorCode::OK);
-    EXPECT_EQ(dispatched, 1);
-    channel->policy = PolicyCommand{AdmissionResult{}};
-    EXPECT_EQ(client.PollAndDispatchPolicy(), ErrorCode::OK);
-    EXPECT_EQ(dispatched, 2);
-    EXPECT_EQ(channel->acknowledged_delivery_id, 42);
-    EXPECT_TRUE(channel->acknowledged_success);
-    channel->policy.reset();
-    EXPECT_EQ(client.PollAndDispatchPolicy(), ErrorCode::OK);
-    EXPECT_EQ(dispatched, 2);
+    EXPECT_EQ(unavailable.ReportMetricBatch(batch),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 }
 
 TEST(IoPatternFrameworkTest, ResilientChannelRetriesAndTracksDegrade) {
@@ -849,15 +807,14 @@ TEST(IoPatternFrameworkTest, ResilientChannelRetriesAndTracksDegrade) {
     EXPECT_TRUE(channel.degraded());
 }
 
-TEST(IoPatternFrameworkTest, EmptyPolicyPollKeepsChannelHealthy) {
-    auto idle = std::make_shared<TestCfmChannel>();
-    ResilientCfmChannel channel(
-        idle, CfmRetryConfig{.max_retries = 2, .degrade_after_failures = 2});
-
-    EXPECT_FALSE(channel.PollPolicy().has_value());
-    EXPECT_FALSE(channel.PollPolicy().has_value());
-    EXPECT_EQ(channel.consecutive_failures(), 0);
+TEST(IoPatternFrameworkTest, ResilientChannelRecoversAfterSuccess) {
+    auto flaky = std::make_shared<FlakyCfmChannel>();
+    ResilientCfmChannel channel(flaky, CfmRetryConfig{.max_retries = 2,
+                                                      .degrade_after_failures = 1});
+    MetricBatch batch;
+    EXPECT_TRUE(channel.SendMetricBatch(batch));
     EXPECT_FALSE(channel.degraded());
+    EXPECT_EQ(channel.consecutive_failures(), 0);
 }
 
 TEST(IoPatternFrameworkTest, ResilientAnalyzerFallsBackAfterFailure) {
@@ -877,9 +834,8 @@ TEST(IoPatternFrameworkTest, RpcChannelUsesCodecTransportAndTimeout) {
     EXPECT_EQ(transport->last_method, "report_snapshot");
     EXPECT_EQ(transport->last_payload, "snapshot");
     EXPECT_EQ(transport->last_timeout, std::chrono::milliseconds(25));
-    transport->response = "policy";
-    EXPECT_TRUE(channel.PollPolicy().has_value());
     EXPECT_EQ(channel.ExecutePrefetch({}), ErrorCode::OK);
+    EXPECT_EQ(transport->last_method, "execute_prefetch");
     auto rpc_channel = std::make_shared<CfmRpcChannel>(transport, codec);
     IoPatternReporter reporter(2, MakeCfmMetricBatchSink(rpc_channel));
     reporter.Enqueue(InferenceMetrics{});
@@ -888,6 +844,7 @@ TEST(IoPatternFrameworkTest, RpcChannelUsesCodecTransportAndTimeout) {
     EXPECT_EQ(transport->last_payload, "batch");
     transport->send_ok = false;
     EXPECT_EQ(channel.ExecutePrefetch({}), ErrorCode::RPC_TIMEOUT);
+    EXPECT_FALSE(channel.SendSnapshot({}));
 }
 
 TEST(IoPatternFrameworkTest, BinaryCfmCodecRoundTripsAllPolicyCommands) {
@@ -949,29 +906,23 @@ TEST(IoPatternFrameworkTest, BinaryCfmCodecRoundTripsAllPolicyCommands) {
     EXPECT_TRUE(decoded_batch->accesses.front().is_hit);
 }
 
-TEST(IoPatternFrameworkTest, InProcessCfmTransportAuthenticatesAndDispatches) {
+TEST(IoPatternFrameworkTest, InProcessCfmTransportDispatchesReports) {
     CfmBinaryCodec codec;
     bool received_snapshot = false;
     auto transport = std::make_shared<InProcessCfmRpcTransport>(
-        "shared-secret", [&received_snapshot](std::string_view method,
-                                                 std::string_view) {
+        [&received_snapshot](std::string_view method, std::string_view) {
             received_snapshot = method == "report_snapshot";
             return received_snapshot;
         });
-    CfmRpcChannel authorized(transport, std::make_shared<CfmBinaryCodec>(),
-                             {.auth_token = "shared-secret"});
-    EXPECT_TRUE(authorized.SendSnapshot({}));
+    CfmRpcChannel channel(transport, std::make_shared<CfmBinaryCodec>());
+    EXPECT_TRUE(channel.SendSnapshot({}));
     EXPECT_TRUE(received_snapshot);
 
-    transport->EnqueuePolicy(codec.EncodePolicy(
-        AdmissionResult{.object = {TenantId("tenant"), "key"},
-                        .decision = AdmissionDecision::kAdmit}));
-    ASSERT_TRUE(authorized.PollPolicy().has_value());
-
-    auto rejected = std::make_shared<InProcessCfmRpcTransport>("secret");
-    CfmRpcChannel unauthorized(rejected, std::make_shared<CfmBinaryCodec>(),
-                               {.auth_token = "wrong"});
-    EXPECT_FALSE(unauthorized.SendSnapshot({}));
+    // Without a bound handler the transport has no receiver; the embedded
+    // receiver path is exercised through CfmService/CfmIngress instead.
+    auto unbound = std::make_shared<InProcessCfmRpcTransport>();
+    CfmRpcChannel unbound_channel(unbound, std::make_shared<CfmBinaryCodec>());
+    EXPECT_TRUE(unbound_channel.SendSnapshot({}));
 }
 
 TEST(IoPatternFrameworkTest, InProcessTransportDoesNotHoldLockAcrossHandler) {
@@ -979,12 +930,11 @@ TEST(IoPatternFrameworkTest, InProcessTransportDoesNotHoldLockAcrossHandler) {
     std::promise<void> release_handler;
     auto release = release_handler.get_future().share();
     auto transport = std::make_shared<InProcessCfmRpcTransport>(
-        "shared-secret", [&](std::string_view, std::string_view) {
+        [&](std::string_view, std::string_view) {
             handler_entered.set_value();
             release.wait();
             return true;
         });
-    ASSERT_TRUE(transport->Authenticate("shared-secret"));
 
     std::thread sender([&] {
         EXPECT_TRUE(transport->Send("report_snapshot", {},
@@ -997,12 +947,13 @@ TEST(IoPatternFrameworkTest, InProcessTransportDoesNotHoldLockAcrossHandler) {
         FAIL() << "send handler did not start";
         return;
     }
-    auto enqueue = std::async(std::launch::async, [&] {
-        transport->EnqueuePolicy("policy");
-        return true;
+    // A concurrent Send must not deadlock on the transport mutex while the
+    // first handler is still executing.
+    std::thread second([&] {
+        EXPECT_TRUE(transport->Send("report_snapshot", {},
+                                    std::chrono::milliseconds(10)));
     });
-    EXPECT_EQ(enqueue.wait_for(std::chrono::milliseconds(100)),
-              std::future_status::ready);
+    second.join();
     release_handler.set_value();
     sender.join();
 }
@@ -1035,7 +986,7 @@ TEST(IoPatternFrameworkTest, CfmIngressFeedsRuntimeFromMetricBatches) {
     EXPECT_EQ(snapshot.keys.front().access_count_window, 1);
 }
 
-TEST(IoPatternFrameworkTest, CfmServiceAuthenticatesAndBoundsPolicyQueues) {
+TEST(IoPatternFrameworkTest, CfmServiceMergesReportsAndExecutesLocally) {
     int admissions = 0;
     auto runtime = std::make_shared<IoPatternRuntime>(
         IoPatternRuntime::Handlers{
@@ -1045,71 +996,66 @@ TEST(IoPatternFrameworkTest, CfmServiceAuthenticatesAndBoundsPolicyQueues) {
                 ++admissions;
                 return ErrorCode::OK;
             }});
-    CfmService service(runtime, "secret", 1, "producer");
+    CfmService service(runtime);
     CfmBinaryCodec codec;
 
-    EXPECT_FALSE(service.Authenticate("wrong"));
-    EXPECT_TRUE(service.Authenticate("secret"));
-    EXPECT_FALSE(service.EnqueuePolicy("node-a", "first", "secret"));
+    // Reports are merged into the single local runtime: no per-node runtime,
+    // no policy queue and no credential gate.
+    MetricBatch batch;
+    batch.inference.push_back(
+        InferenceMetrics{.object = {TenantId("tenant"), "key"},
+                         .session_id = "session",
+                         .token_count = 32});
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(batch)));
+    const auto merged = service.Snapshot();
+    ASSERT_EQ(merged.keys.size(), 1);
+    EXPECT_EQ(merged.keys.front().object.key, "key");
+
+    // A delivered policy command executes through the local runtime handlers.
     const auto admission = codec.EncodePolicy(AdmissionResult{
         .object = {TenantId("tenant"), "key"},
         .target_tier = CacheTier::kL1Host,
         .decision = AdmissionDecision::kAdmit});
-    const auto second = codec.EncodePolicy(PrefetchPlan{});
-    EXPECT_FALSE(service.EnqueuePolicy("node-a", "malformed", "producer"));
-    EXPECT_TRUE(service.EnqueuePolicy("node-a", admission, "producer"));
-    EXPECT_FALSE(service.EnqueuePolicy("node-a", second, "producer"));
-    const auto delivery = service.PollPolicy("node-a", "secret");
-    ASSERT_TRUE(delivery.has_value());
-    EXPECT_EQ(delivery->second, admission);
-    EXPECT_TRUE(service.AcknowledgePolicy("node-a", delivery->first, false,
-                                         "secret"));
-    EXPECT_TRUE(service.PollPolicy("node-a", "secret").has_value());
-    EXPECT_TRUE(service.AcknowledgePolicy("node-a", delivery->first, true,
-                                         "secret"));
-    EXPECT_FALSE(service.PollPolicy("node-a", "secret").has_value());
-
-    EXPECT_FALSE(service.Send("", "execute_policy", admission, "secret"));
-    EXPECT_FALSE(
-        service.Send("node-a", "execute_policy", admission, "secret"));
-    EXPECT_TRUE(
-        service.Send("node-a", "execute_policy", admission, "producer"));
+    ASSERT_TRUE(service.Send("execute_policy", admission));
+    EXPECT_EQ(admissions, 1);
+    EXPECT_FALSE(service.Send("execute_policy", "malformed"));
     EXPECT_EQ(admissions, 1);
 }
 
-TEST(IoPatternFrameworkTest, CfmAggregatesMetricsBySubmasterNode) {
+TEST(IoPatternFrameworkTest, CfmServiceMergesAllReportsIntoLocalRuntime) {
     auto runtime = std::make_shared<IoPatternRuntime>(
         IoPatternRuntime::Handlers{
             .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
             .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
             .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
-    CfmService service(runtime, "secret", 8, "producer");
+    CfmService service(runtime);
     CfmBinaryCodec codec;
 
-    MetricBatch submaster_a;
-    submaster_a.accesses.push_back(
+    MetricBatch first;
+    first.accesses.push_back(
         AccessRecord{.object = {TenantId("tenant"), "key-a"},
                      .block_size = 64,
                      .tier = CacheTier::kL1Host,
                      .is_hit = true});
-    MetricBatch submaster_b;
-    submaster_b.accesses.push_back(
+    MetricBatch second;
+    second.accesses.push_back(
         AccessRecord{.object = {TenantId("tenant"), "key-b"},
                      .block_size = 128,
                      .tier = CacheTier::kL1Host,
                      .is_hit = true});
 
-    ASSERT_TRUE(service.Send("submaster-a", "report_metric_batch",
-                             codec.EncodeMetricBatch(submaster_a), "secret"));
-    ASSERT_TRUE(service.Send("submaster-b", "report_metric_batch",
-                             codec.EncodeMetricBatch(submaster_b), "secret"));
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(first)));
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(second)));
 
-    const auto snapshot_a = service.SnapshotForNode("submaster-a");
-    const auto snapshot_b = service.SnapshotForNode("submaster-b");
-    ASSERT_EQ(snapshot_a.keys.size(), 1);
-    ASSERT_EQ(snapshot_b.keys.size(), 1);
-    EXPECT_EQ(snapshot_a.keys.front().object.key, "key-a");
-    EXPECT_EQ(snapshot_b.keys.front().object.key, "key-b");
+    // Ownership-addressed reports all land on the receiving SubMaster, whose
+    // CFM component owns a single local runtime.
+    const auto snapshot = service.Snapshot();
+    ASSERT_EQ(snapshot.keys.size(), 2);
+    EXPECT_EQ(snapshot.keys[0].object.key, "key-a");
+    EXPECT_EQ(snapshot.keys[1].object.key, "key-b");
 }
 
 TEST(IoPatternFrameworkTest, CoroRpcCfmTransportRunsTheProductionWirePath) {
@@ -1118,80 +1064,57 @@ TEST(IoPatternFrameworkTest, CoroRpcCfmTransportRunsTheProductionWirePath) {
             .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
             .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
             .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
-    auto service =
-        std::make_shared<CfmService>(runtime, "secret", 2, "producer");
+    auto service = std::make_shared<CfmService>(runtime);
     CfmRpcService endpoint(service);
     coro_rpc::coro_rpc_server server(1, 0, "127.0.0.1");
-    server.register_handler<&CfmRpcService::Authenticate>(&endpoint);
     server.register_handler<&CfmRpcService::Send>(&endpoint);
-    server.register_handler<&CfmRpcService::Receive>(&endpoint);
-    server.register_handler<&CfmRpcService::Acknowledge>(&endpoint);
-    server.register_handler<&CfmRpcService::EnqueuePolicy>(&endpoint);
     ASSERT_FALSE(server.async_start().hasResult());
 
-    const auto rejected_poll =
-        endpoint.Receive("poll_policy", "node-a", "wrong");
-    EXPECT_FALSE(rejected_poll.first);
-    const auto empty_poll = endpoint.Receive("poll_policy", "node-a", "secret");
-    EXPECT_TRUE(empty_poll.first);
-    EXPECT_FALSE(empty_poll.second.has_value());
-
     CoroRpcCfmTransport transport(
-        "127.0.0.1:" + std::to_string(server.port()), "node-a",
+        "127.0.0.1:" + std::to_string(server.port()),
         std::chrono::milliseconds(500));
-    EXPECT_FALSE(transport.Authenticate("wrong"));
-    ASSERT_TRUE(transport.Authenticate("secret"));
 
     CfmBinaryCodec codec;
     MetricBatch batch;
     batch.accesses.push_back(
         AccessRecord{.object = {TenantId("tenant"), "remote-key"},
                      .is_hit = true});
-    batch.storage.push_back(StorageMetric{.source_id = "spoofed",
+    batch.storage.push_back(StorageMetric{.source_id = "reporter",
                                           .tier = CacheTier::kL1Host,
                                           .memory_used_ratio = 0.75F});
     EXPECT_TRUE(transport.Send("report_metric_batch",
                                codec.EncodeMetricBatch(batch),
                                std::chrono::milliseconds(500)));
-    const auto snapshot = service->SnapshotForNode("node-a");
+    // No authentication: the SubMaster merges the report into its local
+    // runtime and treats the transport source as the metric origin.
+    const auto snapshot = service->Snapshot();
     ASSERT_EQ(snapshot.keys.size(), 1);
     ASSERT_EQ(snapshot.storage.size(), 1);
     EXPECT_EQ(snapshot.keys.front().object.key, "remote-key");
-    EXPECT_EQ(snapshot.storage.front().source_id, "node-a");
+    EXPECT_EQ(snapshot.storage.front().source_id, "reporter");
 
-    const auto policy = codec.EncodePolicy(PrefetchPlan{});
-    CoroRpcCfmTransport producer(
-        "127.0.0.1:" + std::to_string(server.port()), "producer",
-        std::chrono::milliseconds(500));
-    ASSERT_TRUE(producer.Authenticate("producer"));
-    EXPECT_TRUE(producer.EnqueuePolicy("node-a", policy,
-                                       std::chrono::milliseconds(500)));
-    const auto received =
-        transport.Receive("poll_policy", std::chrono::milliseconds(500));
-    EXPECT_EQ(received.status, CfmReceiveResult::Status::kPayload);
-    EXPECT_EQ(received.payload, policy);
-    EXPECT_NE(received.delivery_id, 0);
-    EXPECT_TRUE(transport.Acknowledge(received.delivery_id, false,
-                                      std::chrono::milliseconds(500)));
-    const auto redelivered =
-        transport.Receive("poll_policy", std::chrono::milliseconds(500));
-    EXPECT_EQ(redelivered.delivery_id, received.delivery_id);
-    EXPECT_EQ(redelivered.payload, policy);
-    EXPECT_TRUE(transport.Acknowledge(redelivered.delivery_id, true,
-                                      std::chrono::milliseconds(500)));
-    EXPECT_EQ(transport.Receive("poll_policy", std::chrono::milliseconds(500))
-                  .status,
-              CfmReceiveResult::Status::kEmpty);
+    // Snapshot reports follow the same unauthenticated path.
+    IoPatternSnapshot snapshot_report;
+    snapshot_report.keys.push_back(
+        KeyMetrics{.object = {TenantId("tenant"), "snap-key"}});
+    EXPECT_TRUE(transport.Send("report_snapshot",
+                               codec.EncodeSnapshot(snapshot_report),
+                               std::chrono::milliseconds(500)));
+    EXPECT_EQ(service->Snapshot().keys.back().object.key, "snap-key");
     server.stop();
 }
 
-TEST(IoPatternFrameworkTest, CfmProducesNodePolicyFromHighWatermarkReport) {
+TEST(IoPatternFrameworkTest, LocalCfmExecutesEvictionOnHighWatermarkSnapshot) {
+    // High-watermark policy now runs in the SubMaster's own runtime rather
+    // than in a separate central CFM process. Reports feed that runtime; a
+    // storage observation at >= 0.90 memory ratio then triggers a local
+    // eviction plan executed through the SubMaster handlers.
     auto runtime = std::make_shared<IoPatternRuntime>(
         IoPatternRuntime::Handlers{
             .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
             .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
             .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
-    CfmService service(runtime, "node-secret", 8, "producer-secret");
+    CfmService service(runtime);
     CfmBinaryCodec codec;
     MetricBatch batch;
     batch.accesses.push_back(
@@ -1199,80 +1122,16 @@ TEST(IoPatternFrameworkTest, CfmProducesNodePolicyFromHighWatermarkReport) {
                      .block_size = 1024,
                      .tier = CacheTier::kL1Host,
                      .is_hit = false});
-    batch.storage.push_back(StorageMetric{.tier = CacheTier::kL1Host,
-                                          .used_bytes = 950,
-                                          .capacity_bytes = 1000,
-                                          .memory_used_ratio = 0.95F});
-    ASSERT_TRUE(service.Send("node-a", "report_metric_batch",
-                             codec.EncodeMetricBatch(batch), "node-secret"));
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(batch)));
+    ASSERT_EQ(runtime->Snapshot().keys.size(), 1);
 
-    std::optional<std::pair<uint64_t, std::string>> delivery;
-    for (size_t attempt = 0; attempt < 100 && !delivery; ++attempt) {
-        delivery = service.PollPolicy("node-a", "node-secret");
-        if (!delivery) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    ASSERT_TRUE(delivery.has_value());
-    const auto command = codec.DecodePolicy(delivery->second);
-    ASSERT_TRUE(command.has_value());
-    const auto* eviction = std::get_if<EvictionPlan>(&*command);
-    ASSERT_NE(eviction, nullptr);
-    ASSERT_EQ(eviction->candidates.size(), 1);
-    EXPECT_EQ(eviction->candidates.front().object.key, "cold-key");
-    EXPECT_TRUE(service.AcknowledgePolicy("node-a", delivery->first, true,
-                                         "node-secret"));
-}
-
-TEST(IoPatternFrameworkTest, CfmPolicyDoesNotCrossSubmasterKeySets) {
-    auto runtime = std::make_shared<IoPatternRuntime>(
-        IoPatternRuntime::Handlers{
-            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
-            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
-            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
-    CfmService service(runtime, "node-secret", 8, "producer-secret");
-    CfmBinaryCodec codec;
-
-    MetricBatch submaster_b;
-    submaster_b.accesses.push_back(
-        AccessRecord{.object = {TenantId("tenant"), "key-b"},
-                     .block_size = 4096,
-                     .tier = CacheTier::kL1Host,
-                     .is_hit = false});
-    ASSERT_TRUE(service.Send("submaster-b", "report_metric_batch",
-                             codec.EncodeMetricBatch(submaster_b),
-                             "node-secret"));
-
-    MetricBatch submaster_a;
-    submaster_a.accesses.push_back(
-        AccessRecord{.object = {TenantId("tenant"), "key-a"},
-                     .block_size = 1024,
-                     .tier = CacheTier::kL1Host,
-                     .is_hit = false});
-    submaster_a.storage.push_back(
-        StorageMetric{.tier = CacheTier::kL1Host,
-                      .used_bytes = 950,
-                      .capacity_bytes = 1000,
-                      .memory_used_ratio = 0.95F});
-    ASSERT_TRUE(service.Send("submaster-a", "report_metric_batch",
-                             codec.EncodeMetricBatch(submaster_a),
-                             "node-secret"));
-    ASSERT_TRUE(service.WaitForPolicyIdle(std::chrono::milliseconds(500)));
-
-    std::optional<std::pair<uint64_t, std::string>> delivery;
-    for (size_t attempt = 0; attempt < 100 && !delivery; ++attempt) {
-        delivery = service.PollPolicy("submaster-a", "node-secret");
-        if (!delivery) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    ASSERT_TRUE(delivery.has_value());
-    EXPECT_GE(service.ObservabilityForNode("submaster-a").policy_decisions,
-              1);
-    const auto command = codec.DecodePolicy(delivery->second);
-    ASSERT_TRUE(command.has_value());
-    const auto* eviction = std::get_if<EvictionPlan>(&*command);
-    ASSERT_NE(eviction, nullptr);
-    ASSERT_FALSE(eviction->candidates.empty());
-    for (const auto& candidate : eviction->candidates) {
-        EXPECT_EQ(candidate.object.key, "key-a");
-    }
+    // Eviction is local: Execute() plans against the merged snapshot and
+    // invokes the storage handler directly (no policy delivery round trip).
+    const auto status = runtime->Execute(CacheTier::kL1Host, 1024,
+                                         TraceHistory{});
+    EXPECT_EQ(status.eviction, ErrorCode::OK);
+    EXPECT_GE(runtime->ObservabilitySnapshot().policy_decisions, 1);
 }
 
 TEST(IoPatternFrameworkTest, ReporterBackgroundLifecycleFlushesOnStop) {
@@ -1625,12 +1484,10 @@ TEST(IoPatternFrameworkTest, RuntimeExecutesCfmCommandsThroughStorageHandlers) {
              ++admissions;
              return ErrorCode::OK;
          }});
-    CfmClientImpl client(
-        std::make_shared<TestCfmChannel>(),
-        [&runtime](const PolicyCommand& command) {
-            return runtime.ExecuteCommand(command);
-        });
-    EXPECT_EQ(client.ReceivePolicy(
+    // In the embedded architecture the receiving SubMaster executes delivered
+    // policy commands through its own runtime; there is no client-side
+    // dispatch loop any more.
+    EXPECT_EQ(runtime.ExecuteCommand(
                   AdmissionResult{.object = {TenantId("tenant"), "key"},
                                   .decision = AdmissionDecision::kAdmit}),
               ErrorCode::OK);
@@ -1656,6 +1513,57 @@ TEST(IoPatternFrameworkTest, RuntimeSchedulesAdmissionOffTheProducerPath) {
     ASSERT_EQ(result.wait_for(std::chrono::seconds(1)),
               std::future_status::ready);
     EXPECT_EQ(result.get().object, access.object);
+}
+
+TEST(IoPatternFrameworkTest, OwnershipClientBucketsReportsByResolvedOwner) {
+    auto runtime = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
+    auto service = std::make_shared<CfmService>(runtime);
+    CfmRpcService endpoint(service);
+    coro_rpc::coro_rpc_server server(1, 0, "127.0.0.1");
+    server.register_handler<&CfmRpcService::Send>(&endpoint);
+    ASSERT_FALSE(server.async_start().hasResult());
+    const std::string owner_endpoint =
+        "127.0.0.1:" + std::to_string(server.port());
+
+    // Only keys starting with "owned/" resolve to the single SubMaster under
+    // test; "foreign/" and empty resolver results are dropped.
+    CfmOwnershipClient client(
+        [&](const TenantId&, const std::string& key)
+            -> std::optional<std::string> {
+            return key.rfind("owned/", 0) == 0
+                       ? std::optional<std::string>(owner_endpoint)
+                       : std::nullopt;
+        },
+        std::chrono::milliseconds(500));
+
+    MetricBatch batch;
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "owned/key-a"},
+                     .block_size = 64,
+                     .tier = CacheTier::kL1Host,
+                     .is_hit = true});
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "owned/key-b"},
+                     .block_size = 64,
+                     .tier = CacheTier::kL1Host,
+                     .is_hit = true});
+    batch.inference.push_back(InferenceMetrics{
+        .object = {TenantId("tenant"), "foreign/key"}, .session_id = "s"});
+
+    EXPECT_EQ(client.ReportMetricBatch(batch), ErrorCode::OK);
+    EXPECT_EQ(client.dropped_observations(), 1);
+
+    // Both owned observations were aggregated into one batch for the resolved
+    // owner and merged into that SubMaster's local runtime.
+    const auto snapshot = service->Snapshot();
+    ASSERT_EQ(snapshot.keys.size(), 2);
+    EXPECT_EQ(snapshot.keys[0].object.key, "owned/key-a");
+    EXPECT_EQ(snapshot.keys[1].object.key, "owned/key-b");
+    server.stop();
 }
 
 }  // namespace

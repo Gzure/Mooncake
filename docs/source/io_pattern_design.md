@@ -957,7 +957,8 @@ Store/Get/Put -> Collector -> bounded Analyzer -> PolicyEngine -> Ops
                  |                 |                   |-> Prefetch handler
                  |                 |                   `-> Admission handler
                  |                 `-> per-session K-means fallback
-                 `-> Reporter -> authenticated CFM channel/pool
+                 `-> CfmIngress <- report_metric_batch/report_snapshot (coro_rpc)
+                     (merge into the SubMaster's own runtime)
 ```
 
 `MasterService` owns the runtime because it owns the authoritative replica
@@ -967,15 +968,17 @@ by the Store master.
 
 ### Current implementation architecture
 
-The following diagram is the implementation-level view. It distinguishes the
-local Store data path from the optional *remote* central CFM deployment: metric
-reporting is asynchronous, while a received CFM command is executed by the
-same storage handlers as a locally planned command. The two `MasterService`
-boxes are deployment roles, not two mandatory Mooncake service types. A normal
-deployment has one active Master (plus an optional HA standby); a separate
-central CFM Master is needed only when metrics and policy are centralized
-across multiple Masters. The roles may also be co-located for a single-Master
-deployment.
+CFM is an embedded component of every SubMaster: the SubMaster's own
+`IoPatternRuntime` collects observations from its Store data path, evaluates
+policy and executes through the same storage-safe handlers. There is no
+standalone CFM Master deployment, no separate CFM endpoint and no auth token.
+A reporting client (inference connector / Store client) observes keys that may
+live on many SubMasters, resolves the owning SubMaster for every key through
+the CVM key->slot->submaster mapping, aggregates observations per owner and
+sends metric batches to each owning SubMaster's regular `coro_rpc` endpoint.
+The receiving SubMaster merges the report into its local runtime so
+collection, analysis and execution all stay on the SubMaster that owns the
+reported keys.
 
 ```mermaid
 flowchart TB
@@ -986,10 +989,11 @@ flowchart TB
         storage["Storage and watermark paths\nStorageMetric"]
     end
 
-    subgraph local["Reporting / policy-consuming MasterService"]
+    subgraph local["SubMaster MasterService (embedded CFM)"]
         direction TB
         runtime["IoPatternRuntime"]
         collector["IoPatternCollectorImpl\nper-tenant/object aggregation\nrolling snapshot"]
+        ingress["CfmIngress\nmerge ownership-addressed reports"]
         reporter["IoPatternReporter\nbounded MetricBatch queue\nadaptive 100/200/500/1000 ms flush"]
         analyzer["ResilientAnalyzer\nSlidingWindowAnalyzer\nbudget + timeout fallback"]
         policy["DegradingPolicyEngine\nWorkloadPolicyEngine\nper-session templates"]
@@ -997,6 +1001,7 @@ flowchart TB
         feedback["PolicyFeedbackWindow +\nAdaptivePolicyTuner"]
         admission_worker["Admission worker\nbounded deferred queue"]
 
+        ingress --> runtime
         runtime --> collector
         collector --> reporter
         collector --> analyzer
@@ -1014,49 +1019,36 @@ flowchart TB
         admit["Admission\npost-write retention / promotion"]
     end
 
-    subgraph transport["Optional authenticated CFM transport"]
+    subgraph client["Reporting client (connector / Store client)"]
         direction LR
+        owner["CvmOwnershipClient\nCVM key→slot→submaster bucketing"]
         codec["CfmBinaryCodec\nversioned CFM2 wire format"]
-        channel["CfmRpcChannel\nauthenticate + encode/decode"]
-        resilient["ResilientCfmChannel\nbounded retry + degradation state"]
-        rpc["CoroRpcCfmTransport\nexisting coro_rpc client pool"]
-        codec --> channel --> resilient
-        channel --> rpc
+        channel["CfmRpcChannel\nencode/decode"]
+        rpc["CoroRpcCfmTransport\ncoro_rpc to the owning SubMaster"]
+        owner --> codec --> channel --> rpc
     end
 
-    subgraph central["Central CFM MasterService"]
-        direction TB
-        rpc_service["CfmRpcService\nAuthenticate / Send / Receive /\nAcknowledge / EnqueuePolicy"]
-        service["CfmService\nauthentication + per-node bounded queues"]
-        ingress["CfmIngress\ndecode and normalize remote metrics"]
-        central_runtime["IoPatternRuntime\nCollector → Analyzer → PolicyEngine"]
-        producer_worker["PolicyProducerWorker\nproduce high-watermark eviction\nand trace-derived prefetch commands"]
-        policy_queue["Policy queue per stable node_id\ndelivery_id + ACK state"]
-        rpc_service --> service --> ingress --> central_runtime --> producer_worker --> policy_queue
-    end
+    rpc_service["CfmRpcService::Send\non the SubMaster's coro_rpc port"]
 
-    inference --> runtime
+    inference -->|"ownership-addressed metric batches"| owner
     access --> runtime
     storage --> runtime
     executor --> evict
     executor --> prefetch
     executor --> admit
 
-    reporter -->|"report_metric_batch"| channel
-    rpc -->|"authenticated RPC"| rpc_service
-    policy_queue -->|"poll_policy"| rpc
-    resilient --> client["CfmClientImpl\nPollAndDispatchPolicy"]
-    client -->|"PolicyCommand"| runtime
-    client -->|"ACK success / failure"| resilient
-
-    external_producer["External policy producer\nproducer credential"] -->|"enqueue_policy"| rpc_service
+    reporter -->|"report_metric_batch"| ingress
+    rpc -->|"report_metric_batch / report_snapshot / execute_*"| rpc_service
+    rpc_service --> ingress
     observability["IoPatternObservability\nlatency, hit rate, false positives,\ndegradation, report drops"] -.-> runtime
 ```
 
-`CfmClientImpl` is deliberately not the normal metric-reporting entry point in
-the production wiring. `IoPatternReporter` sends metric batches directly
-through `CfmRpcChannel`; the client object owns the polling, dispatch and ACK
-loop for CFM-issued policy commands.
+`CfmOwnershipClient` (or a single-endpoint `CfmRpcChannel` when one SubMaster
+is the only owner) is the normal report path. `CfmClientImpl` wraps a single
+channel for connectors; the client owns aggregation per owning SubMaster and
+explicitly drops observations whose owner cannot be resolved. The receiver
+merges every accepted report into the local runtime — there is no policy
+queue, poll, ACK or producer role to configure.
 
 ## Implemented
 
@@ -1079,14 +1071,18 @@ loop for CFM-issued policy commands.
 - `IoPatternRuntime` wires collection, bounded analysis, policy execution,
   feedback tuning and storage handlers; `MasterService` feeds it from actual
   Get/Put/watermark paths.
-- `CfmClientImpl` dispatches received policy commands through
-  `IoPatternRuntime::ExecuteCommand`, so CFM-issued plans take the same safe
-  Store execution route as locally planned ones.
-- `CfmIngress` is the CFM-to-Store endpoint: it decodes authenticated snapshot
-  and metric-batch payloads into the runtime, and executes remote prefetch
-  plans through the same handlers.
+- `CfmClientImpl` wraps a single reporting channel for connectors
+  (`ReportSnapshot` / `ReportMetricBatch` / `ExecutePrefetch`); policy runs in
+  the SubMaster's own runtime, so there is no client-side dispatch loop.
+- `CfmOwnershipClient` is the multi-SubMaster report path: it resolves the
+  owning SubMaster of every key through a CVM-backed resolver, aggregates
+  observations per owner and delivers one batch per owner; unresolvable
+  observations are counted as drops.
+- `CfmIngress` is the CFM-to-Store endpoint on each SubMaster: it decodes
+  snapshot and metric-batch payloads into that SubMaster's local runtime and
+  executes prefetch/eviction plans through the same storage-safe handlers.
 - `ResilientCfmChannel` adds bounded retries and consecutive-failure
-  degradation state around a concrete transport.
+  degradation state around a concrete reporting transport.
 - `PolicyFeedbackWindow` aggregates bounded execution-effect windows, and
   `AdaptivePolicyTuner` adjusts eviction weights after repeated negative
   hit-rate deltas.
@@ -1109,8 +1105,8 @@ loop for CFM-issued policy commands.
   (or conservative mixed mode) when analysis throws, with failure tracking.
 - `CfmBinaryCodec` defines the versioned `CFM2` protocol and fully round-trips
   snapshots, metric batches and every policy command. `InProcessCfmRpcTransport`
-  provides authenticated embedded operation, while `CfmChannelPool` reuses and
-  fails over a bounded set of injected network channels.
+  provides embedded operation for tests, while `CfmChannelPool` reuses and
+  fails over a bounded set of reporting channels.
 - `CfmRpcChannel::SendMetricBatch` and `MakeCfmMetricBatchSink` connect the
   bounded Reporter to the RPC path; producers only enqueue and Flush performs
   the transport call outside the data-path critical section.
@@ -1140,8 +1136,6 @@ loop for CFM-issued policy commands.
   promotion evaluation. This is a post-write cache-admission hook, not initial
   replica placement: the existing `PutStart` contract selects and allocates
   replicas before write metrics such as batch and overwrite are known.
-- CFM polling distinguishes a command, a healthy empty queue and a transport
-  error. Only transport errors contribute to consecutive-failure degradation.
 - Reporter intervals follow the documented memory/RPC load thresholds
   (100/200/500/1000 ms), and in-process transport callbacks execute outside the
   transport mutex.
@@ -1201,46 +1195,34 @@ RPC resources are injected through execution handlers and CFM channels.
 
 ## Production CFM wiring
 
-Master registers authenticated CFM handlers on its existing `coro_rpc` port.
-`CoroRpcCfmTransport` is the production client: metric batches are delivered to
-`CfmIngress`, while policy commands use a bounded per-node queue and are polled
-by stable `node_id`. Received commands execute through
-`IoPatternRuntime::ExecuteCommand`, preserving the same storage-safe handlers as
-local policy decisions. Every report RPC also carries that `node_id`; ingress
-uses it as the authoritative storage-metric source so central aggregation does
-not merge watermarks from different Masters.
+Every Master registers the CFM report handler (`CfmRpcService::Send`) on its
+existing `coro_rpc` port — the same endpoint all other Mooncake RPCs use. No
+extra `io_pattern_cfm_endpoint`, `io_pattern_cfm_auth_token`,
+`io_pattern_cfm_node_id` or producer credential is configured: Mooncake RPCs
+run inside the trusted deployment, and CFM is a component of the SubMaster
+that owns the reported keys.
 
-Configure a central CFM receiver with `io_pattern_cfm_auth_token`. Configure each
-reporting/policy-consuming Master with:
+A SubMaster's embedded CFM works as follows:
 
-- `io_pattern_cfm_endpoint=host:port`
-- `io_pattern_cfm_node_id=<stable unique node id>` (defaults to the local CVM
-  SubMaster RPC endpoint, `rpc_address:rpc_port`)
-- the same `io_pattern_cfm_auth_token`
-- on the central receiver only, a distinct
-  `io_pattern_cfm_producer_auth_token` for policy producers
-- optional `io_pattern_cfm_timeout_ms` and
-  `io_pattern_cfm_policy_queue_capacity`
+- The local Store data path records `AccessRecord` / `StorageMetric` straight
+  into the SubMaster's own `IoPatternRuntime`; eviction runs through the same
+  storage-safe quota/promotion handlers (no per-node runtime, policy queue or
+  poll loop).
+- A reporting client (vLLM/SGLang connector or the Store client) observes keys
+  that may belong to different SubMasters. It resolves the owner of each key
+  with the CVM mapping (`cvm::KeySlot` over the `/cvm/<ns>` master registry),
+  aggregates observations by owning SubMaster, and delivers one
+  `report_metric_batch` / `report_snapshot` per owner over coro_rpc.
+- The receiving SubMaster's `CfmIngress` merges the batch into its local
+  runtime and normalizes remote StorageMetric watermarks against the
+  transport source, so collection, analysis and execution never leave the
+  SubMaster that owns the keys.
 
-An outbound Master authenticates during construction and fails startup if the
-configured CFM endpoint cannot be reached or rejects the token. At runtime the
-Reporter sends metric batches over the channel and a resilient poll loop
-dispatches queued policies. On the receiver, each accepted metric batch is put
-onto a bounded policy-production queue; the central runtime runs
-Collector -> Analyzer -> PolicyEngine asynchronously and automatically queues
-high-watermark eviction and trace-derived prefetch commands for the reporting
-`node_id`. An external policy producer may also call the registered
-`CfmRpcService::EnqueuePolicy` RPC with a target node id and an encoded
-`PolicyCommand`.
-
-Node credentials cannot use that explicit enqueue RPC; an external producer
-must authenticate with the separately configured producer credential. The
-server validates commands before enqueueing them, assigns a delivery id, and
-retains each command until the target node acknowledges successful execution.
-Its poll response distinguishes an authenticated empty queue from a rejected
-or invalid request, so authorization failures enter the normal degradation
-path. The configured capacity is enforced for both pending production work and
-policy delivery, with policy delivery bounded both per node and globally.
+Reports that fail to resolve to an owner are counted as dropped observations
+on the client, so callers degrade explicitly instead of guessing an owner.
+Explicit `execute_prefetch` / `execute_policy` RPCs are also accepted by the
+same handler and run through the receiving SubMaster's local storage
+handlers, preserving the storage-safe execution seam for cross-node commands.
 
 The SGLang adapter remains framework-neutral because SGLang source is not
 vendored in this repository.

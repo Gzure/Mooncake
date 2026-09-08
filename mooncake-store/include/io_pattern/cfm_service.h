@@ -1,111 +1,64 @@
 #pragma once
 
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
-#include <condition_variable>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <unordered_map>
 #include <utility>
 
 #include "cfm_ingress.h"
+#include "observability.h"
+#include "types.h"
 
 namespace mooncake::io_pattern {
 
-// Authenticated server-side CFM endpoint. The RPC layer delegates to this
-// class, keeping authentication, bounded policy queues and runtime dispatch
-// independent of the concrete network transport.
+// Embedded CFM endpoint of one SubMaster. There is no standalone CFM Master:
+// every SubMaster runs the full IO Pattern pipeline locally and accepts
+// ownership-addressed metric reports over its regular coro_rpc port (the same
+// endpoint the rest of Mooncake uses). Received batches are merged straight
+// into the local runtime so collection, analysis and policy execution all stay
+// on the SubMaster that owns the reported keys.
+//
+// Reports are addressed by key ownership, so a receiving SubMaster only ever
+// merges observations for keys that belong to its own slots. A separate node
+// identity, delivery queues and a poll/ack loop are therefore unnecessary: the
+// reporting client fans each batch out to the owning SubMaster(s) using the
+// CVM key->slot->submaster mapping.
 class CfmService final {
    public:
-    CfmService(std::shared_ptr<IoPatternRuntime> runtime,
-               std::string auth_token, size_t policy_queue_capacity = 4096,
-               std::string producer_auth_token = {});
-    ~CfmService();
+    explicit CfmService(std::shared_ptr<IoPatternRuntime> runtime);
 
-    bool Authenticate(std::string_view token) const;
-    bool AuthenticateNode(std::string_view token) const;
-    bool AuthenticateProducer(std::string_view token) const;
-    bool Send(std::string_view node_id, std::string_view method,
-              std::string_view payload, std::string_view token);
-    std::optional<std::pair<uint64_t, std::string>> PollPolicy(
-        std::string_view node_id, std::string_view token);
-    bool AcknowledgePolicy(std::string_view node_id, uint64_t delivery_id,
-                           bool success, std::string_view token);
-    bool EnqueuePolicy(std::string node_id, std::string payload,
-                       std::string_view token);
+    // RPC entry point. Supported methods:
+    //   report_metric_batch / report_snapshot  -> merge into the local runtime
+    //   execute_prefetch / execute_policy      -> execute through the local
+    //                                             runtime's storage handlers
+    // `source_id` identifies the reporting process and is used to normalize
+    // remote StorageMetric watermarks.
+    bool Send(std::string_view method, std::string_view payload,
+              std::string_view source_id = {});
 
-    // Returns the metrics aggregated for one CFM node. In a CVM deployment a
-    // node is a stable SubMaster identity, so policy generation for one slot
-    // owner must never observe keys reported by another SubMaster.
-    IoPatternSnapshot SnapshotForNode(std::string_view node_id) const;
-    IoPatternObservabilitySnapshot ObservabilityForNode(
-        std::string_view node_id, double window_seconds = 0.0) const;
-    bool WaitForPolicyIdle(std::chrono::milliseconds timeout);
+    IoPatternSnapshot Snapshot() const;
+    IoPatternObservabilitySnapshot Observability(
+        double window_seconds = 0.0) const;
 
    private:
-    struct NodeRuntime {
-        std::shared_ptr<IoPatternRuntime> runtime;
-        std::unique_ptr<CfmIngress> ingress;
-    };
-
-    bool EnqueueValidated(std::string node_id, std::string payload);
-    std::shared_ptr<NodeRuntime> GetOrCreateNodeRuntime(
-        std::string_view node_id);
-    std::shared_ptr<NodeRuntime> FindNodeRuntime(
-        std::string_view node_id) const;
-    void SchedulePolicyProduction(std::string node_id, MetricBatch batch);
-    void PolicyProducerWorker();
-    void ProducePolicies(std::string_view node_id, const MetricBatch& batch);
-
     std::shared_ptr<IoPatternRuntime> runtime_;
     std::shared_ptr<CfmBinaryCodec> codec_;
     CfmIngress ingress_;
-    mutable std::mutex node_runtimes_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<NodeRuntime>>
-        node_runtimes_;
-    const std::string auth_token_;
-    const std::string producer_auth_token_;
-    const size_t policy_queue_capacity_;
-    std::mutex mutex_;
-    std::unordered_map<std::string,
-                       std::deque<std::pair<uint64_t, std::string>>>
-        policy_queues_;
-    uint64_t next_delivery_id_{1};
-    size_t total_queued_policies_{0};
-    std::mutex producer_mutex_;
-    std::condition_variable producer_cv_;
-    std::deque<std::pair<std::string, MetricBatch>> pending_metric_batches_;
-    size_t active_policy_productions_{0};
-    bool producer_stopping_{false};
-    std::condition_variable producer_idle_cv_;
-    std::thread producer_worker_;
 };
 
-// coro_rpc-facing adapter. Keeping RPC signatures here lets both the Master
-// server and integration tests register the exact production endpoints.
+// coro_rpc-facing adapter. Keeping the RPC signature here lets both the
+// SubMaster server and integration tests register the exact production
+// endpoint.
 class CfmRpcService final {
    public:
     explicit CfmRpcService(std::shared_ptr<CfmService> service)
         : service_(std::move(service)) {}
 
-    bool Authenticate(const std::string& auth_token);
-    bool Send(const std::string& node_id, const std::string& method,
-              const std::string& payload, const std::string& auth_token);
-    // The boolean explicitly distinguishes a rejected request from an
-    // authenticated queue that currently has no policy.
-    std::pair<bool, std::optional<std::pair<uint64_t, std::string>>> Receive(
-        const std::string& method, const std::string& node_id,
-        const std::string& auth_token);
-    bool Acknowledge(const std::string& node_id, uint64_t delivery_id,
-                     bool success, const std::string& auth_token);
-    bool EnqueuePolicy(const std::string& node_id, const std::string& payload,
-                       const std::string& auth_token);
+    bool Send(const std::string& method, const std::string& payload,
+              const std::string& source_id = {});
 
    private:
     std::shared_ptr<CfmService> service_;

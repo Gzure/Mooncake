@@ -18,17 +18,6 @@ namespace mooncake {
 // Forwarded to the HA serve phase via MasterServiceSupervisorConfig.
 class HttpMetadataServer;
 
-struct IoPatternCfmConfig {
-    // Empty endpoint means this Master only serves the CFM RPC endpoints.
-    // Set host:port to report to and poll policies from a central CFM Master.
-    std::string endpoint;
-    std::string node_id;
-    std::string auth_token;
-    std::string producer_auth_token;
-    uint32_t timeout_ms{500};
-    uint32_t policy_queue_capacity{4096};
-};
-
 inline std::string ResolveConfiguredHABackendConnstring(
     std::string_view ha_backend_type, std::string_view ha_backend_connstring,
     std::string_view etcd_endpoints) {
@@ -51,7 +40,6 @@ struct MasterConfig {
     std::string rpc_interface;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
-    IoPatternCfmConfig io_pattern_cfm;
 
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
@@ -227,7 +215,6 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
-    IoPatternCfmConfig io_pattern_cfm;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
@@ -373,7 +360,6 @@ class MasterServiceSupervisorConfig {
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
-        io_pattern_cfm = config.io_pattern_cfm;
         ha_backend_type = config.ha_backend_type;
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
@@ -568,7 +554,6 @@ class WrappedMasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
-    IoPatternCfmConfig io_pattern_cfm;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
@@ -674,7 +659,6 @@ class WrappedMasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
-        io_pattern_cfm = config.io_pattern_cfm;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -799,7 +783,6 @@ class WrappedMasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
-        io_pattern_cfm = config.io_pattern_cfm;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -914,7 +897,6 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
-    IoPatternCfmConfig io_pattern_cfm_;
     VChunkConfig vchunk_config_{};
     std::shared_ptr<VChunkMetadataStore> vchunk_metadata_store_;
 
@@ -1217,11 +1199,6 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_io_pattern_cfm(IoPatternCfmConfig config) {
-        io_pattern_cfm_ = std::move(config);
-        return *this;
-    }
-
     MasterServiceConfig build() const;
 };
 
@@ -1277,8 +1254,6 @@ class MasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
-    // CFM transport and authentication settings used by this MasterService.
-    IoPatternCfmConfig io_pattern_cfm;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
@@ -1381,7 +1356,6 @@ class MasterServiceConfig {
         kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
         kv_events_emit_object_key = config.kv_events_emit_object_key;
         kv_events_queue_capacity = config.kv_events_queue_capacity;
-        io_pattern_cfm = config.io_pattern_cfm;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         enable_oplog = config.enable_oplog;
@@ -1502,7 +1476,6 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
-    config.io_pattern_cfm = io_pattern_cfm_;
     config.vchunk_config = vchunk_config_;
     config.vchunk_metadata_store = vchunk_metadata_store_;
     config.vchunk_config = vchunk_config_;

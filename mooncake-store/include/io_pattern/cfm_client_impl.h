@@ -1,34 +1,28 @@
 #pragma once
 
 #include <memory>
-#include <functional>
+#include <utility>
 
 #include "cfm_channel.h"
 #include "client.h"
 
 namespace mooncake::io_pattern {
 
-// Production CFM client orchestration. Network behavior is delegated to the
-// injected channel so this class remains independent of RPC libraries.
+// Reporting client used by inference-side connectors and integration tests.
+// Network behavior is delegated to the injected channel; the client is what a
+// vLLM/SGLang connector sees when it reports IO Pattern observations for keys
+// owned by the addressed SubMaster.
 class CfmClientImpl final : public CfmClient {
    public:
-    using PolicyCommandHandler = std::function<ErrorCode(const PolicyCommand&)>;
-
-    explicit CfmClientImpl(std::shared_ptr<CfmChannel> channel,
-                           PolicyCommandHandler policy_handler = {})
-        : channel_(std::move(channel)),
-          policy_handler_(std::move(policy_handler)) {}
+    explicit CfmClientImpl(std::shared_ptr<CfmChannel> channel)
+        : channel_(std::move(channel)) {}
 
     ErrorCode ReportSnapshot(const IoPatternSnapshot& snapshot) override;
-    ErrorCode ReceivePolicy(const PolicyCommand& command) override;
+    ErrorCode ReportMetricBatch(const MetricBatch& batch) override;
     ErrorCode ExecutePrefetch(const PrefetchPlan& plan) override;
-
-    std::optional<PolicyCommand> PollPolicy();
-    ErrorCode PollAndDispatchPolicy();
 
    private:
     std::shared_ptr<CfmChannel> channel_;
-    PolicyCommandHandler policy_handler_;
 };
 
 }  // namespace mooncake::io_pattern

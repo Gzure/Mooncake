@@ -2070,11 +2070,7 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     auto& cfm = wrapped_master_service.CfmRpcEndpoint();
-    server.register_handler<&io_pattern::CfmRpcService::Authenticate>(&cfm);
     server.register_handler<&io_pattern::CfmRpcService::Send>(&cfm);
-    server.register_handler<&io_pattern::CfmRpcService::Receive>(&cfm);
-    server.register_handler<&io_pattern::CfmRpcService::Acknowledge>(&cfm);
-    server.register_handler<&io_pattern::CfmRpcService::EnqueuePolicy>(&cfm);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutRevoke>(

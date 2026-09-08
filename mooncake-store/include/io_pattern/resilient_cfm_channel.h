@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <utility>
 
 #include "cfm_channel.h"
 
@@ -21,8 +22,7 @@ class ResilientCfmChannel final : public CfmChannel {
         : delegate_(std::move(delegate)), config_(config) {}
 
     bool SendSnapshot(const IoPatternSnapshot& snapshot) override;
-    CfmPollResult PollPolicyResult() override;
-    bool AcknowledgePolicy(uint64_t delivery_id, bool success) override;
+    bool SendMetricBatch(const MetricBatch& batch) override;
     ErrorCode ExecutePrefetch(const PrefetchPlan& plan) override;
 
     bool degraded() const;

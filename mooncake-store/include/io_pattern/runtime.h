@@ -64,15 +64,17 @@ class IoPatternRuntime final {
         const TraceHistory& trace,
         const std::vector<ObjectRef>& admissions = {},
         const std::string& session_id = {});
-    // Runs Collector -> Analyzer -> PolicyEngine without invoking local
-    // storage handlers. Central CFM uses this to produce commands for a
-    // target node; Store data paths continue to use Execute().
+    // Runs Collector -> Analyzer -> PolicyEngine without invoking the local
+    // storage handlers. Callers use Plan when they need the raw policy result
+    // (for example the local eviction watermark path, observability or tests);
+    // Store data paths continue to use Execute().
     PolicyResult Plan(CacheTier eviction_tier, uint64_t eviction_bytes,
                       const TraceHistory& trace,
                       const std::vector<ObjectRef>& admissions = {},
                       const std::string& session_id = {});
     // Applies a CFM-issued command through the same storage handlers as a
-    // locally planned policy. This is the CFM-to-Store execution endpoint.
+    // locally planned policy. This is the CFM-to-Store execution endpoint used
+    // by the embedded SubMaster CFM receiver.
     ErrorCode ExecuteCommand(const PolicyCommand& command);
     bool ScheduleAdmission(ObjectRef object, CacheTier target_tier,
                            std::string session_id = {});

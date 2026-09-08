@@ -5,7 +5,7 @@
 namespace mooncake::io_pattern {
 
 // Versioned binary wire codec for the CFM RPC methods. It deliberately owns
-// every serialization detail so transports only deal in authenticated bytes.
+// every serialization detail so transports only deal in method/payload bytes.
 class CfmBinaryCodec final : public CfmRpcCodec {
    public:
     std::string EncodeSnapshot(const IoPatternSnapshot& snapshot) const override;
