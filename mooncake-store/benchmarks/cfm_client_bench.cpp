@@ -139,6 +139,19 @@ DEFINE_bool(hard_pin, false, "Pin seeded objects (disable eviction of them)");
 DEFINE_uint64(seed_get_keys, 0,
               "How many of the seeded keys to read back with get_into "
               "(0 = half of num_keys)");
+// Report RPC timeout. A merged report can carry hundreds of thousands of
+// observations; the old fixed 500 ms budget caused report_metric_batch RPC
+// failures on large batches. Also bounds how long the ownership client waits
+// per SubMaster delivery.
+DEFINE_uint64(cfm_rpc_timeout_ms, 5000,
+              "Timeout for each CFM report RPC (report_snapshot / "
+              "report_metric_batch) in milliseconds");
+// Client-side collector/analysis key budget. The default 100k cap drops
+// observations once the simulated request stream exceeds it (seen as nonzero
+// \"report drops\"); raise it to cover the whole run when reporting many keys.
+DEFINE_uint64(max_analysis_keys, 100000,
+              "Max merged keys kept/analyzed by the client runtime and the "
+              "embedded SubMaster runtime (raise with the request stream size)");
 
 uint64_t SteadyNowNs() {
     return static_cast<uint64_t>(
@@ -700,6 +713,7 @@ int main(int argc, char* argv[]) {
         // reflect report-triggered policy execution, not only the manual
         // watermark evaluation at the end of the run.
         cfm_config.report_driven_execution = true;
+        cfm_config.max_analysis_keys = FLAGS_max_analysis_keys;
         cfm_runtime = std::make_shared<IoPatternRuntime>(
             IoPatternRuntime::Handlers{
                 .eviction = [&eviction_commands](const EvictionPlan&) {
@@ -720,11 +734,12 @@ int main(int argc, char* argv[]) {
             std::make_shared<EmbeddedCfmTransport>(embedded_service);
         embedded_channel = std::make_shared<CfmRpcChannel>(
             std::move(transport), std::make_shared<CfmBinaryCodec>(),
-            CfmRpcConfig{.timeout = std::chrono::milliseconds(500)});
+            CfmRpcConfig{.timeout =
+                             std::chrono::milliseconds(FLAGS_cfm_rpc_timeout_ms)});
     } else {
         const auto resolver = ResolveCfmEndpointOwnership();
-        ownership_client =
-            std::make_shared<CfmOwnershipClient>(resolver, std::chrono::milliseconds(500));
+        ownership_client = std::make_shared<CfmOwnershipClient>(
+            resolver, std::chrono::milliseconds(FLAGS_cfm_rpc_timeout_ms));
         deployment_description = "remote SubMaster(s) via CFM coro_rpc";
     }
 
@@ -737,6 +752,8 @@ int main(int argc, char* argv[]) {
 
     IoPatternRuntime::Config source_config;
     source_config.report_capacity = FLAGS_report_capacity;
+    source_config.max_analysis_keys = FLAGS_max_analysis_keys;
+    source_config.collector.max_total_keys = FLAGS_max_analysis_keys;
     MetricReportStats metric_reports;
     const auto report_metric_batch = [&](const MetricBatch& batch) -> bool {
         const auto started = Clock::now();
