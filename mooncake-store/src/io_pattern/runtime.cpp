@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <future>
+#include <limits>
 #include <thread>
 
 namespace mooncake::io_pattern {
@@ -396,6 +397,30 @@ void IoPatternRuntime::DeriveEvictionRequest(const IoPatternSnapshot& snapshot,
                          : (capacity_bytes > 0 ? capacity_bytes / 10 : 0);
 }
 
+uint64_t IoPatternRuntime::ColdEvictionBudget(
+    const IoPatternSnapshot& snapshot, uint64_t idle_threshold_us,
+    uint64_t max_bytes) {
+    if (max_bytes == 0) return 0;
+    uint64_t budget = 0;
+    for (const auto& key : snapshot.keys) {
+        if ((key.replica_tiers & CacheTierBit(CacheTier::kL1Host)) == 0 ||
+            key.pinned) {
+            continue;
+        }
+        if (idle_threshold_us != 0 &&
+            key.idle_time_us < idle_threshold_us) {
+            continue;
+        }
+        // Skip keys with no capacity estimate (block_size unset/unknown).
+        if (key.block_size == 0) continue;
+        budget = budget > std::numeric_limits<uint64_t>::max() - key.block_size
+                     ? std::numeric_limits<uint64_t>::max()
+                     : budget + key.block_size;
+        if (budget >= max_bytes) return max_bytes;
+    }
+    return budget;
+}
+
 TraceHistory IoPatternRuntime::DeriveTraceHistory(
     const IoPatternSnapshot& snapshot) {
     // Report-driven prefetch input: keys that were recently served as hits and
@@ -457,6 +482,22 @@ void IoPatternRuntime::RunReportDrivenCycle() {
     DeriveEvictionRequest(snapshot, config_.report_eviction_high_ratio,
                           config_.report_eviction_target_ratio, eviction_tier,
                           eviction_bytes);
+    // Cold-data eviction driver: when the merged storage watermark does not
+    // trigger a pressure eviction but the analysis-relevant snapshot contains
+    // idle L1 keys, run a bounded eviction of the coldest keys so eviction is
+    // driven by cold/hot analysis and not only by memory pressure. Candidate
+    // selection still goes through the policy engine (ScoreBasedEvictionOps
+    // ranks the coldest first); this driver only supplies a byte target.
+    if (eviction_bytes == 0 && config_.report_driven_cold_eviction &&
+        config_.report_driven_cold_eviction_bytes != 0) {
+        const uint64_t cold_bytes = ColdEvictionBudget(
+            snapshot, config_.report_driven_cold_idle_threshold_us,
+            config_.report_driven_cold_eviction_bytes);
+        if (cold_bytes != 0) {
+            eviction_bytes = cold_bytes;
+            report.cold_eviction = true;
+        }
+    }
     report.eviction_tier = eviction_tier;
     report.eviction_target_bytes = eviction_bytes;
     const auto trace = DeriveTraceHistory(snapshot);

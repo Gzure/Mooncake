@@ -21,6 +21,15 @@
 //     like a Store client, then buckets each key to its owning SubMaster.
 //     The receiving side is not observable here, so only client-side latency
 //     is reported.
+//
+// Remote policy execution is only observable when the SubMaster actually owns
+// the reported keys: its eviction/promotion/prefetch handlers operate on real
+// replicas, so a report-only run leaves the master-side counters at zero. When
+// --master_server and --num_keys are provided, a real-data seeding stage runs
+// first ("先种子后仿真"): it writes a batch of real KV objects through
+// RealClient (keys share the simulated KvKey naming and tenant) and reads a
+// subset back to simulate access heat, then the simulated vLLM request stream
+// reports on those same keys.
 
 #include <algorithm>
 #include <atomic>
@@ -43,6 +52,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <numa.h>
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
@@ -54,6 +64,7 @@
 #include "io_pattern/cfm_service.h"
 #include "io_pattern/rpc_transport.h"
 #include "io_pattern/runtime.h"
+#include "real_client.h"
 #include "types.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
@@ -95,6 +106,39 @@ DEFINE_string(cfm_cluster_namespace, "",
               "MC_STORE_CLUSTER_ID or mooncake_cluster (same rule as the "
               "etcd leader coordinator). When the cluster was started with a "
               "non-default cluster_id, pass the same value here");
+
+// Real Store client parameters used by the optional real-data seeding stage.
+// Flag names and defaults mirror stress_cluster_bench.cpp so an existing
+// cluster invocation can be reused as-is. Seeding makes the SubMaster hold
+// real replicas for the reported keys, which is what the IO Pattern eviction /
+// promotion / prefetch handlers operate on (without real objects they remain
+// no-ops even when reports trigger policy cycles).
+DEFINE_string(master_server, "",
+              "Master server address (host:port) for RealClient writes; empty "
+              "disables real-data seeding");
+DEFINE_string(local_hostname, "localhost",
+              "Local hostname (with optional port, e.g. node1:12345)");
+DEFINE_string(metadata_server, "http://127.0.0.1:8080/metadata",
+              "Metadata server URL for RealClient setup");
+DEFINE_string(protocol, "tcp", "Transport protocol: tcp, rdma, ub");
+DEFINE_string(device_name, "", "RDMA/UB device name (comma-separated)");
+DEFINE_uint64(global_segment_size, 16ULL * 1024 * 1024 * 1024,
+              "Global segment size in bytes (per store node)");
+DEFINE_uint64(local_buffer_size, 512ULL * 1024 * 1024,
+              "Local client buffer size in bytes");
+DEFINE_bool(enable_ssd_offload, false,
+            "Enable LOCAL_DISK offload when seeding real keys (requires the "
+            "SubMaster to run with offload enabled)");
+DEFINE_string(ssd_offload_path, "", "SSD offload directory path");
+DEFINE_uint64(num_keys, 0,
+              "Number of real keys to write during seeding (0 = disabled)");
+DEFINE_uint64(value_size, 4ULL * 1024 * 1024,
+              "Size in bytes of each seeded real KV object");
+DEFINE_uint64(replica_num, 1, "Number of replicas for each seeded object");
+DEFINE_bool(hard_pin, false, "Pin seeded objects (disable eviction of them)");
+DEFINE_uint64(seed_get_keys, 0,
+              "How many of the seeded keys to read back with get_into "
+              "(0 = half of num_keys)");
 
 uint64_t SteadyNowNs() {
     return static_cast<uint64_t>(
@@ -494,6 +538,138 @@ bool ValidateFlags() {
            FLAGS_memory_used_ratio <= 1.0;
 }
 
+// Real-data seeding stage (optional). The IO Pattern runtime on the SubMaster
+// only executes storage handlers against replicas that actually exist, so a
+// report-only benchmark leaves master-side eviction/promotion/prefetch counters
+// at zero. When --master_server and --num_keys are provided this stage writes a
+// batch of real KV objects through RealClient (same key/tenant naming as the
+// simulated requests, so the analysis snapshot and the real metadata overlap)
+// and reads a subset back to simulate access heat.
+struct SeedStats {
+    uint64_t written{0};
+    uint64_t write_failures{0};
+    uint64_t reads{0};
+    uint64_t read_failures{0};
+};
+
+SeedStats RunRealSeedStage() {
+    SeedStats stats;
+    if (FLAGS_master_server.empty() || FLAGS_num_keys == 0 ||
+        FLAGS_value_size == 0) {
+        return stats;
+    }
+    LOG(INFO) << "Real-data seed stage: master_server=" << FLAGS_master_server
+              << " protocol=" << FLAGS_protocol
+              << " keys=" << FLAGS_num_keys
+              << " value_size=" << FLAGS_value_size
+              << " replica_num=" << FLAGS_replica_num
+              << " offload=" << (FLAGS_enable_ssd_offload ? "yes" : "no");
+
+    auto client = mooncake::RealClient::create();
+    const size_t block_bytes = std::max<size_t>(FLAGS_value_size, 4096);
+    char* buffer = reinterpret_cast<char*>(numa_alloc_local(block_bytes));
+    if (buffer == nullptr) {
+        LOG(ERROR) << "numa_alloc_local failed for seed buffer of "
+                   << block_bytes << " bytes";
+        return stats;
+    }
+    std::memset(buffer, 0xA5, block_bytes);
+    int ret = client->setup_real(
+        FLAGS_local_hostname, FLAGS_metadata_server, FLAGS_global_segment_size,
+        FLAGS_local_buffer_size, FLAGS_protocol, FLAGS_device_name,
+        FLAGS_master_server, nullptr, "", FLAGS_enable_ssd_offload,
+        FLAGS_ssd_offload_path, FLAGS_tenant);
+    if (ret != 0) {
+        LOG(ERROR) << "setup_real failed: " << ret;
+        numa_free(buffer, block_bytes);
+        return stats;
+    }
+    ret = client->register_buffer(buffer, block_bytes);
+    if (ret != 0) {
+        LOG(ERROR) << "register_buffer failed: " << ret;
+        numa_free(buffer, block_bytes);
+        return stats;
+    }
+
+    // Write keys that share the simulated KvKey naming so later reports and
+    // the real metadata address the same objects. Enumerate the same
+    // (session, request, layer, block) space as BuildRequest() and stop after
+    // --num_keys objects, so the seeded set is exactly the head of the
+    // reported key universe (real replicas exist for the keys policy will
+    // select).
+    mooncake::ReplicateConfig config;
+    config.replica_num = static_cast<size_t>(FLAGS_replica_num);
+    config.with_hard_pin = FLAGS_hard_pin;
+    const uint64_t total_tokens = FLAGS_prompt_tokens + FLAGS_output_tokens;
+    const size_t blocks = BlockCount(total_tokens);
+    const size_t shared_blocks =
+        std::min(blocks, BlockCount(FLAGS_shared_prefix_tokens));
+    uint64_t seeded = 0;
+    for (size_t request_index = 0;
+         request_index < FLAGS_requests && seeded < FLAGS_num_keys;
+         ++request_index) {
+        const size_t session = request_index % FLAGS_num_sessions;
+        for (size_t layer = 0; layer < FLAGS_num_layers && seeded < FLAGS_num_keys;
+             ++layer) {
+            for (size_t block = 0; block < blocks && seeded < FLAGS_num_keys;
+                 ++block) {
+                const bool is_shared_prefix = block < shared_blocks;
+                const std::string key =
+                    KvKey(session, request_index, layer, block, is_shared_prefix);
+                const int put_ret =
+                    client->put_from(key, buffer, FLAGS_value_size, config);
+                if (put_ret == 0) {
+                    ++seeded;
+                } else {
+                    ++stats.write_failures;
+                    LOG(WARNING) << "put_from failed for seed key " << key
+                                 << ": " << put_ret;
+                }
+            }
+        }
+    }
+    stats.written = seeded;
+
+    // Simulate reads: exercise a hot subset through the real data path so the
+    // SubMaster records real GET access heat (promotion-on-hit when offloaded).
+    // Re-enumerate the same key space in the same order and read the first
+    // read_count keys.
+    const uint64_t read_count = FLAGS_seed_get_keys == 0
+                                    ? seeded / 2
+                                    : std::min<uint64_t>(FLAGS_seed_get_keys,
+                                                         seeded);
+    uint64_t read_keys = 0;
+    for (size_t request_index = 0;
+         request_index < FLAGS_requests && read_keys < read_count;
+         ++request_index) {
+        const size_t session = request_index % FLAGS_num_sessions;
+        for (size_t layer = 0;
+             layer < FLAGS_num_layers && read_keys < read_count; ++layer) {
+            for (size_t block = 0; block < blocks && read_keys < read_count;
+                 ++block) {
+                const bool is_shared_prefix = block < shared_blocks;
+                const std::string key =
+                    KvKey(session, request_index, layer, block, is_shared_prefix);
+                const int64_t got = client->get_into(key, buffer, FLAGS_value_size);
+                if (got >= 0) {
+                    ++stats.reads;
+                } else {
+                    ++stats.read_failures;
+                }
+                ++read_keys;
+            }
+        }
+    }
+
+    client->unregister_buffer(buffer);
+    numa_free(buffer, block_bytes);
+    LOG(INFO) << "Real-data seed stage done: written=" << stats.written
+              << " write_failures=" << stats.write_failures
+              << " reads=" << stats.reads
+              << " read_failures=" << stats.read_failures;
+    return stats;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -551,6 +727,13 @@ int main(int argc, char* argv[]) {
             std::make_shared<CfmOwnershipClient>(resolver, std::chrono::milliseconds(500));
         deployment_description = "remote SubMaster(s) via CFM coro_rpc";
     }
+
+    // Real-data seeding runs before the simulated request stream ("先种子后仿
+    // 真"): the SubMaster must hold real replicas for reported keys before the
+    // report-driven policy cycle can execute eviction/promotion/prefetch
+    // against them. Only meaningful with a real SubMaster endpoint
+    // (--cfm_endpoint) plus RealClient parameters; otherwise it is a no-op.
+    const SeedStats seed_stats = RunRealSeedStage();
 
     IoPatternRuntime::Config source_config;
     source_config.report_capacity = FLAGS_report_capacity;
@@ -654,6 +837,10 @@ int main(int argc, char* argv[]) {
               << "CFM CLIENT BENCHMARK (vLLM inference request model)\n"
               << "============================================================\n"
               << "  CFM deployment:          " << deployment_description << "\n"
+              << "  Real-data seeding:       written=" << seed_stats.written
+              << " (failures=" << seed_stats.write_failures
+              << "), reads=" << seed_stats.reads
+              << " (failures=" << seed_stats.read_failures << ")\n"
               << "  Requests:                " << FLAGS_requests << "\n"
               << "  Tokens/request:          "
               << FLAGS_prompt_tokens + FLAGS_output_tokens << " (prompt="

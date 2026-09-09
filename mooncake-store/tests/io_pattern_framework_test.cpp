@@ -1256,6 +1256,61 @@ TEST(IoPatternFrameworkTest, ReportDrivenCycleSkipsEvictionWithoutPressure) {
     EXPECT_EQ(eviction_handled.load(), 0);
 }
 
+TEST(IoPatternFrameworkTest, ReportDrivenColdEvictionRunsWithoutPressure) {
+    // The cold-data eviction driver must run even when no storage watermark
+    // pressure is present: a report that only contains idle L1 keys still
+    // yields a bounded eviction request (cold_eviction=true) so eviction is
+    // driven by cold/hot analysis, not only by memory pressure.
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    std::optional<IoPatternRuntime::ReportDrivenCycleReport> last_report;
+    std::atomic<int> eviction_handled{0};
+    IoPatternRuntime::Config config;
+    config.report_driven_execution = true;
+    config.report_driven_cold_eviction = true;
+    config.report_driven_cold_eviction_bytes = 128ULL * 1024 * 1024;
+    config.report_driven_cold_idle_threshold_us = 0;  // any idle L1 key counts
+    config.analysis_timeout_us = 30'000'000;
+    config.report_driven_observer =
+        [&](const IoPatternRuntime::ReportDrivenCycleReport& report) {
+            std::lock_guard lock(observer_mutex);
+            last_report = report;
+            observer_condition.notify_all();
+        };
+    auto rt = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [&eviction_handled](const EvictionPlan&) {
+                ++eviction_handled;
+                return ErrorCode::OK;
+            },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        std::move(config));
+    CfmService service(rt);
+    CfmBinaryCodec codec;
+    MetricBatch batch;
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "cold-key"},
+                     .observed_at_ns = 1,
+                     .block_size = 1024,
+                     .tier = CacheTier::kL1Host,
+                     .operation = IoOperation::kGet,
+                     .is_hit = true});
+    // No storage metric => no pressure path; only the cold driver can act.
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(batch)));
+
+    std::unique_lock lock(observer_mutex);
+    ASSERT_TRUE(observer_condition.wait_for(lock, std::chrono::seconds(30), [&] {
+        return last_report.has_value();
+    }));
+    ASSERT_TRUE(last_report.has_value());
+    EXPECT_TRUE(last_report->cold_eviction);
+    EXPECT_GT(last_report->eviction_target_bytes, 0);
+    EXPECT_GT(eviction_handled.load(), 0);
+    EXPECT_EQ(last_report->eviction_status, ErrorCode::OK);
+}
+
 TEST(IoPatternFrameworkTest, ReporterBackgroundLifecycleFlushesOnStop) {
     size_t batches = 0;
     IoPatternReporter reporter(4, [&](const MetricBatch&) {

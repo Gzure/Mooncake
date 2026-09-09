@@ -48,6 +48,13 @@ struct MasterConfig {
     double eviction_high_watermark_ratio;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    // When true, merged client reports may drive bounded evictions of the
+    // coldest keys even when the memory watermark is not exceeded. All three
+    // default to disabled (watermark-only eviction) unless explicitly set.
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     int64_t client_live_ttl_sec;
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
@@ -524,6 +531,10 @@ class WrappedMasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
@@ -630,6 +641,11 @@ class WrappedMasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
@@ -1224,6 +1240,10 @@ class MasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
@@ -1327,6 +1347,11 @@ class MasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;

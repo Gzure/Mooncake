@@ -452,6 +452,21 @@ MasterService::MasterService(const MasterServiceConfig& config)
         static_cast<float>(eviction_high_watermark_ratio_);
     io_pattern_config.report_eviction_target_ratio = static_cast<float>(
         std::max(0.0, eviction_high_watermark_ratio_ - eviction_ratio_));
+    // Cold-data eviction driver: allow merged reports to reclaim the coldest
+    // real objects even below the memory watermark (opt-in via master flags).
+    io_pattern_config.report_driven_cold_eviction =
+        config.io_pattern_cold_eviction;
+    io_pattern_config.report_driven_cold_eviction_bytes =
+        config.io_pattern_cold_eviction_bytes_per_cycle;
+    io_pattern_config.report_driven_cold_idle_threshold_us =
+        config.io_pattern_cold_idle_threshold_us;
+    if (config.io_pattern_cold_eviction) {
+        LOG(INFO) << "Report-driven cold-data eviction enabled: per-cycle "
+                     "budget="
+                  << config.io_pattern_cold_eviction_bytes_per_cycle
+                  << " bytes, idle threshold="
+                  << config.io_pattern_cold_idle_threshold_us << " us";
+    }
     io_pattern_config.report_driven_observer =
         [](const io_pattern::IoPatternRuntime::ReportDrivenCycleReport& rpt) {
             auto& metrics = MasterMetricManager::instance();
@@ -490,7 +505,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << ", bytes=" << rpt.eviction_target_bytes
                       << ", candidates=" << rpt.eviction_candidates
                       << ", status=" << static_cast<int>(rpt.eviction_status)
-                      << ")"
+                      << ", cold=" << rpt.cold_eviction << ")"
                       << " prefetch(candidates=" << rpt.prefetch_candidates
                       << ", status=" << static_cast<int>(rpt.prefetch_status)
                       << ")"

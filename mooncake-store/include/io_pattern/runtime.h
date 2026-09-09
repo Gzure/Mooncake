@@ -51,6 +51,10 @@ class IoPatternRuntime final {
         uint64_t eviction_target_bytes{0};
         size_t eviction_candidates{0};
         ErrorCode eviction_status{ErrorCode::OK};
+        // True when the eviction request came from the cold-data driver
+        // (analysis-selected idle keys) rather than a storage-pressure
+        // watermark request.
+        bool cold_eviction{false};
         // Prefetch dimension (derived from merged prefix-affinity keys).
         size_t prefetch_candidates{0};
         ErrorCode prefetch_status{ErrorCode::OK};
@@ -91,6 +95,20 @@ class IoPatternRuntime final {
         // ratio is reached; eviction target bytes are derived as
         // (peak_ratio - report_eviction_target_ratio) * capacity_bytes.
         float report_eviction_target_ratio{0.70F};
+        // Cold-data eviction driver. When enabled, a report-driven cycle that
+        // sees no storage-pressure request (merged L1 ratio below the high
+        // watermark) still runs a bounded eviction of the coldest keys, so
+        // eviction is driven by cold/hot analysis rather than only by memory
+        // pressure. Candidate selection and handler execution are identical to
+        // pressure eviction; the cycle report marks `cold_eviction=true` so
+        // logs/metrics can distinguish the two drivers.
+        bool report_driven_cold_eviction{false};
+        // Only keys idle (idle_time_us) at least this long are eligible for a
+        // cold-eviction pass. 0 disables the idle gate.
+        uint64_t report_driven_cold_idle_threshold_us{0};
+        // Max bytes a single cold-eviction pass may request (per drained
+        // cycle). 0 disables the cold driver regardless of the enable flag.
+        uint64_t report_driven_cold_eviction_bytes{0};
         // Optional per-cycle observer used to surface executions in process
         // metrics (e.g. MasterMetricManager). Never called from the report
         // data path; only from the background cycle worker.
@@ -177,6 +195,13 @@ class IoPatternRuntime final {
                                       float high_ratio, float target_ratio,
                                       CacheTier& eviction_tier,
                                       uint64_t& eviction_bytes);
+    // Cold-data eviction driver input: scans the merged snapshot for L1 keys
+    // that are not pinned and idle at least `idle_threshold_us` (0 = any idle
+    // gate disabled) and returns the total byte budget bounded by `max_bytes`.
+    // Returns 0 when there is no idle L1 key to reclaim.
+    static uint64_t ColdEvictionBudget(const IoPatternSnapshot& snapshot,
+                                       uint64_t idle_threshold_us,
+                                       uint64_t max_bytes);
     static TraceHistory DeriveTraceHistory(const IoPatternSnapshot& snapshot);
     static std::vector<ObjectRef> DeriveAdmissionCandidates(
         const IoPatternSnapshot& snapshot);

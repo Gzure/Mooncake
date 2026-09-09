@@ -1060,8 +1060,14 @@ memory (target bytes = excess over the target ratio × reported capacity, only
 when the snapshot also contains L1 keys); keys that were recently served as
 hits and still carry L2/L3 replicas are fed to the prefetch ops, and hot
 lower-tier keys (not pinned, no L1 replica) are offered to the admission ops.
+When no storage watermark is exceeded but the runtime is configured with the
+cold-data eviction driver enabled (`report_driven_cold_eviction`), the cycle
+instead requests a bounded eviction of the coldest (idle) L1 keys so eviction
+is driven by cold/hot analysis and not only by memory pressure; the cycle
+report marks such passes with `cold_eviction=true`.
 Each cycle executes through the same storage-safe handlers, logs one
-`[IO-PATTERN-REPORT-CYCLE]` summary line and reports per-dimension outcomes to
+`[IO-PATTERN-REPORT-CYCLE]` summary line (including whether the pass was a
+cold-eviction driver pass) and reports per-dimension outcomes to
 `MasterMetricManager` (`io_pattern_report_*` counters, visible on the master
 `/metrics` endpoint and in the periodic "Master Admin Metrics" log). This is
 what makes remote-mode policy execution observable: policy is no longer only
@@ -1099,11 +1105,28 @@ explicit `execute_*` RPCs.
   keys to the admission ops; an empty-candidate eviction is a clean no-op, not
   a failure. Every cycle logs one `[IO-PATTERN-REPORT-CYCLE]` line and reports
   its per-dimension outcome (eviction/prefetch/admission candidates, handler
-  statuses, degradation) to the process observer (`MasterMetricManager`
-  `io_pattern_report_*` counters on the master, visible in `/metrics` and the
-  "Master Admin Metrics" log). This keeps remote-mode policy execution
-  observable and data-driven instead of relying only on the local eviction
-  thread, the Put admission hook or explicit `execute_*` RPCs.
+  statuses, degradation, cold-driver flag) to the process observer
+  (`MasterMetricManager` `io_pattern_report_*` counters on the master, visible
+  in `/metrics` and the "Master Admin Metrics" log). This keeps remote-mode
+  policy execution observable and data-driven instead of relying only on the
+  local eviction thread, the Put admission hook or explicit `execute_*` RPCs.
+- The cold-data eviction driver (`report_driven_cold_eviction` runtime config
+  plus `report_driven_cold_eviction_bytes` per-cycle budget and optional
+  `report_driven_cold_idle_threshold_us` gate) runs on the same report-driven
+  worker: when a cycle finds no storage-watermark pressure it still plans a
+  bounded eviction of the coldest non-pinned L1 keys, marks the pass
+  `cold_eviction=true` and executes through the same storage handlers, so
+  eviction is not only triggered at the memory high watermark. `MasterService`
+  surfaces it through `--io_pattern_cold_eviction`,
+  `--io_pattern_cold_eviction_bytes_per_cycle` and
+  `--io_pattern_cold_idle_threshold_us`.
+- `cfm_client_bench` optionally seeds real KV objects (`--master_server`,
+  `--num_keys`, `--value_size`, `--replica_num`, `--protocol` and the other
+  RealClient flags shared with `stress_cluster_bench`) before the simulated
+  vLLM request stream and reads a subset back, so the IO Pattern handlers run
+  against replicas that actually exist on the SubMaster (report-only runs leave
+  eviction/promotion/prefetch counters at zero because the handlers cannot act
+  on objects the master never stored).
 - `CfmClientImpl` wraps a single reporting channel for connectors
   (`ReportSnapshot` / `ReportMetricBatch` / `ExecutePrefetch`); policy runs in
   the SubMaster's own runtime, so there is no client-side dispatch loop.
