@@ -572,11 +572,21 @@ struct SeedStats {
     uint64_t read_failures{0};
 };
 
-SeedStats RunRealSeedStage() {
+// Captures what the seeding stage actually created so the reporting stage can
+// address exactly the real keys (a report stream over synthetic keys whose
+// objects were never stored leaves the SubMaster handlers with nothing to act
+// on, which shows up as OBJECT_NOT_FOUND / zero master-side evictions).
+struct SeedOutcome {
     SeedStats stats;
+    std::vector<std::string> keys;      // real keys written, stable order
+    std::vector<bool> hot;              // parallel: read back (access heat)
+};
+
+SeedOutcome RunRealSeedStage() {
+    SeedOutcome outcome;
     if (FLAGS_master_server.empty() || FLAGS_num_keys == 0 ||
         FLAGS_value_size == 0) {
-        return stats;
+        return outcome;
     }
     LOG(INFO) << "Real-data seed stage: master_server=" << FLAGS_master_server
               << " protocol=" << FLAGS_protocol
@@ -591,7 +601,7 @@ SeedStats RunRealSeedStage() {
     if (buffer == nullptr) {
         LOG(ERROR) << "numa_alloc_local failed for seed buffer of "
                    << block_bytes << " bytes";
-        return stats;
+        return outcome;
     }
     std::memset(buffer, 0xA5, block_bytes);
     int ret = client->setup_real(
@@ -602,13 +612,13 @@ SeedStats RunRealSeedStage() {
     if (ret != 0) {
         LOG(ERROR) << "setup_real failed: " << ret;
         numa_free(buffer, block_bytes);
-        return stats;
+        return outcome;
     }
     ret = client->register_buffer(buffer, block_bytes);
     if (ret != 0) {
         LOG(ERROR) << "register_buffer failed: " << ret;
         numa_free(buffer, block_bytes);
-        return stats;
+        return outcome;
     }
 
     // Write keys that share the simulated KvKey naming so later reports and
@@ -640,20 +650,21 @@ SeedStats RunRealSeedStage() {
                     client->put_from(key, buffer, FLAGS_value_size, config);
                 if (put_ret == 0) {
                     ++seeded;
+                    outcome.keys.push_back(key);
                 } else {
-                    ++stats.write_failures;
+                    ++outcome.stats.write_failures;
                     LOG(WARNING) << "put_from failed for seed key " << key
                                  << ": " << put_ret;
                 }
             }
         }
     }
-    stats.written = seeded;
+    outcome.stats.written = seeded;
 
     // Simulate reads: exercise a hot subset through the real data path so the
     // SubMaster records real GET access heat (promotion-on-hit when offloaded).
-    // Re-enumerate the same key space in the same order and read the first
-    // read_count keys.
+    // Mark the same prefix of the written key list as hot for the report pass.
+    outcome.hot.assign(outcome.keys.size(), false);
     const uint64_t read_count = FLAGS_seed_get_keys == 0
                                     ? seeded / 2
                                     : std::min<uint64_t>(FLAGS_seed_get_keys,
@@ -672,9 +683,12 @@ SeedStats RunRealSeedStage() {
                     KvKey(session, request_index, layer, block, is_shared_prefix);
                 const int64_t got = client->get_into(key, buffer, FLAGS_value_size);
                 if (got >= 0) {
-                    ++stats.reads;
+                    ++outcome.stats.reads;
                 } else {
-                    ++stats.read_failures;
+                    ++outcome.stats.read_failures;
+                }
+                if (read_keys < outcome.hot.size()) {
+                    outcome.hot[read_keys] = true;
                 }
                 ++read_keys;
             }
@@ -683,11 +697,11 @@ SeedStats RunRealSeedStage() {
 
     client->unregister_buffer(buffer);
     numa_free(buffer, block_bytes);
-    LOG(INFO) << "Real-data seed stage done: written=" << stats.written
-              << " write_failures=" << stats.write_failures
-              << " reads=" << stats.reads
-              << " read_failures=" << stats.read_failures;
-    return stats;
+    LOG(INFO) << "Real-data seed stage done: written=" << outcome.stats.written
+              << " write_failures=" << outcome.stats.write_failures
+              << " reads=" << outcome.stats.reads
+              << " read_failures=" << outcome.stats.read_failures;
+    return outcome;
 }
 
 }  // namespace
@@ -756,7 +770,8 @@ int main(int argc, char* argv[]) {
     // report-driven policy cycle can execute eviction/promotion/prefetch
     // against them. Only meaningful with a real SubMaster endpoint
     // (--cfm_endpoint) plus RealClient parameters; otherwise it is a no-op.
-    const SeedStats seed_stats = RunRealSeedStage();
+    const SeedOutcome seed_outcome = RunRealSeedStage();
+    const SeedStats& seed_stats = seed_outcome.stats;
 
     IoPatternRuntime::Config source_config;
     source_config.report_capacity = FLAGS_report_capacity;
@@ -790,8 +805,94 @@ int main(int argc, char* argv[]) {
     uint64_t failed_reports = 0;
     uint64_t total_blocks = 0;
     const auto benchmark_start = Clock::now();
+
+    // When a real seed set was written, report exactly those keys (the ones
+    // with real replicas) instead of the synthetic request stream. Synthetic
+    // keys never stored on the SubMaster pollute the merged snapshot: the
+    // policy engine selects coldest candidates from them, and the storage
+    // handler then finds no real object to evict (OBJECT_NOT_FOUND / zero
+    // master-side evictions). The SubMaster's own data path already records
+    // the real PUT/GET heat for the seeded keys, so reporting the same keys
+    // gives the report-driven cycle candidates that actually exist.
+    const bool real_seed_mode = !seed_outcome.keys.empty();
+    size_t seed_report_requests = 0;
+    if (real_seed_mode) {
+        const auto now_ns = SteadyNowNs();
+        const TenantId tenant(FLAGS_tenant);
+        IoPatternSnapshot real_snapshot;
+        real_snapshot.generated_at_ns = now_ns;
+        real_snapshot.keys.reserve(seed_outcome.keys.size());
+        uint64_t hot_blocks = 0;
+        for (size_t i = 0; i < seed_outcome.keys.size(); ++i) {
+            const auto& key = seed_outcome.keys[i];
+            const bool is_hot = seed_outcome.hot[i];
+            const ObjectRef object{.tenant_id = tenant, .key = key};
+            // Hot keys were read back by the seed stage; cold keys carry an
+            // older last_access so the analyzer sees a hot/cold split over the
+            // real set (matching the benchmark's own read pattern).
+            KeyMetrics key_metrics{
+                .object = object,
+                .session_id = "seed-real-keys",
+                .last_access_time_ns =
+                    is_hot ? now_ns
+                           : (now_ns > 60'000'000'000ULL
+                                  ? now_ns - 60'000'000'000ULL
+                                  : 0ULL),
+                .access_count_window = is_hot ? 4U : 0U,
+                .block_size = FLAGS_value_size,
+                .token_count = 16U,
+                .write_frequency = 1U,
+                .write_object_size = FLAGS_value_size,
+                .replica_tiers = CacheTierBit(CacheTier::kL1Host),
+                .active = is_hot};
+            real_snapshot.keys.push_back(std::move(key_metrics));
+            if (is_hot) ++hot_blocks;
+            // Feed the source runtime too so the client-side printout and the
+            // per-owner report share the same picture.
+            AccessRecord access{
+                .object = object,
+                .observed_at_ns = now_ns,
+                .block_size = FLAGS_value_size,
+                .latency_us = is_hot ? 20U : 200U,
+                .tier = CacheTier::kL1Host,
+                .operation = is_hot ? IoOperation::kGet : IoOperation::kPut,
+                .is_hit = is_hot};
+            source_runtime->RecordAccess(key, access);
+            ++total_blocks;
+        }
+        real_snapshot.storage.push_back(
+            StorageMetric{.source_id = FLAGS_node_id,
+                          .observed_at_ns = now_ns,
+                          .tier = CacheTier::kL1Host,
+                          .read_bandwidth_bytes_per_sec =
+                              20ULL * 1024 * 1024 * 1024,
+                          .write_bandwidth_bytes_per_sec =
+                              10ULL * 1024 * 1024 * 1024,
+                          .read_latency_us = 20,
+                          .write_latency_us = 200,
+                          .used_bytes = static_cast<uint64_t>(
+                              static_cast<double>(FLAGS_value_size) *
+                              seed_outcome.keys.size()),
+                          .capacity_bytes =
+                              static_cast<uint64_t>(FLAGS_num_keys) *
+                              FLAGS_value_size,
+                          .rpc_latency_us = 100,
+                          .memory_used_ratio =
+                              static_cast<float>(FLAGS_memory_used_ratio)});
+        const auto report_start = Clock::now();
+        const bool sent = send_snapshot(real_snapshot);
+        report_latency.Record(ToMicroseconds(Clock::now() - report_start));
+        if (!sent) ++failed_reports;
+        seed_report_requests = 1;
+        LOG(INFO) << "Real-seed report sent: keys="
+                  << real_snapshot.keys.size() << " hot=" << hot_blocks
+                  << " cold=" << real_snapshot.keys.size() - hot_blocks
+                  << " (synthetic request stream skipped)";
+    }
+
     for (size_t request_index = 0; request_index < FLAGS_requests;
          ++request_index) {
+        if (real_seed_mode) break;  // real keys already reported above
         auto request = BuildRequest(request_index);
         total_blocks += request.accesses.size();
         for (size_t i = 0; i < request.inference.size(); ++i) {
