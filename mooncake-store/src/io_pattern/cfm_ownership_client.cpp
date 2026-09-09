@@ -33,8 +33,12 @@ std::shared_ptr<CfmChannel> CfmOwnershipClient::ChannelFor(
 
 ErrorCode CfmOwnershipClient::ReportSnapshot(const IoPatternSnapshot& snapshot) {
     // Bucket keys by their owning SubMaster and report one snapshot per owner.
-    // Storage observations are not routed here: the SubMaster that owns the
-    // storage already reports its own watermark into its local runtime.
+    // Storage observations are not routed by default: the SubMaster that owns
+    // the storage already reports its own watermark into its local runtime.
+    // When forward_storage_ is enabled (benchmark / simulation mode) every
+    // owner-addressed snapshot also carries the reported storage metrics so a
+    // remote run can drive the report-driven eviction dimension on each
+    // owning SubMaster.
     std::unordered_map<std::string, IoPatternSnapshot> by_owner;
     for (const auto& key : snapshot.keys) {
         const auto endpoint = OwnerEndpoint(key.object);
@@ -45,6 +49,12 @@ ErrorCode CfmOwnershipClient::ReportSnapshot(const IoPatternSnapshot& snapshot) 
         auto& owned = by_owner[endpoint];
         owned.generated_at_ns = snapshot.generated_at_ns;
         owned.keys.push_back(key);
+    }
+    if (forward_storage_ && !snapshot.storage.empty() && !by_owner.empty()) {
+        for (auto& [endpoint, owned] : by_owner) {
+            (void)endpoint;
+            owned.storage = snapshot.storage;
+        }
     }
     bool all_ok = true;
     for (const auto& [endpoint, owned] : by_owner) {
@@ -72,7 +82,15 @@ ErrorCode CfmOwnershipClient::ReportMetricBatch(const MetricBatch& batch) {
         }
         by_owner[endpoint].accesses.push_back(access);
     }
-    // batch.storage is intentionally not forwarded (see header/ReportSnapshot).
+    // batch.storage is intentionally not forwarded by default (see
+    // ReportSnapshot); forward_storage_ attaches it to every owner-addressed
+    // batch for benchmark / simulation runs.
+    if (forward_storage_ && !batch.storage.empty() && !by_owner.empty()) {
+        for (auto& [endpoint, owned] : by_owner) {
+            (void)endpoint;
+            owned.storage = batch.storage;
+        }
+    }
     bool all_ok = true;
     for (const auto& [endpoint, owned] : by_owner) {
         auto channel = ChannelFor(endpoint);

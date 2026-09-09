@@ -152,6 +152,13 @@ DEFINE_uint64(cfm_rpc_timeout_ms, 5000,
 DEFINE_uint64(max_analysis_keys, 100000,
               "Max merged keys kept/analyzed by the client runtime and the "
               "embedded SubMaster runtime (raise with the request stream size)");
+// Remote reports normally omit storage watermarks (the owning SubMaster
+// reports its own); enabling this attaches the reported storage metrics to
+// every owner-addressed snapshot/metric batch so a remote run can drive the
+// report-driven eviction dimension from the client side.
+DEFINE_bool(report_forward_storage, false,
+            "Forward StorageMetric observations with remote owner-addressed "
+            "reports (benchmark/simulation mode)");
 
 uint64_t SteadyNowNs() {
     return static_cast<uint64_t>(
@@ -740,6 +747,7 @@ int main(int argc, char* argv[]) {
         const auto resolver = ResolveCfmEndpointOwnership();
         ownership_client = std::make_shared<CfmOwnershipClient>(
             resolver, std::chrono::milliseconds(FLAGS_cfm_rpc_timeout_ms));
+        ownership_client->set_forward_storage(FLAGS_report_forward_storage);
         deployment_description = "remote SubMaster(s) via CFM coro_rpc";
     }
 

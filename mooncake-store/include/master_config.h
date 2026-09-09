@@ -292,6 +292,12 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    // Report-driven cold-data eviction driver (embedded CFM component).
+    // Mirrors MasterConfig / WrappedMasterServiceConfig; carried through the
+    // supervisor config used by HA deployments.
+    bool io_pattern_cold_eviction = false;
+    uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
+    uint64_t io_pattern_cold_idle_threshold_us = 0;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -332,6 +338,11 @@ class MasterServiceSupervisorConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
         nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
@@ -769,6 +780,11 @@ class WrappedMasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_cold_eviction = config.io_pattern_cold_eviction;
+        io_pattern_cold_eviction_bytes_per_cycle =
+            config.io_pattern_cold_eviction_bytes_per_cycle;
+        io_pattern_cold_idle_threshold_us =
+            config.io_pattern_cold_idle_threshold_us;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;

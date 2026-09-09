@@ -51,9 +51,14 @@ class CfmOwnershipClient final : public CfmClient {
 
     // Sends the metric batch, grouped by the owning SubMaster of each
     // inference/access object. Storage observations are deliberately not
-    // routed: the SubMaster that owns the underlying storage already reports
-    // its own watermark to its local runtime.
+    // routed by default: the SubMaster that owns the underlying storage
+    // already reports its own watermark to its local runtime. Benchmark /
+    // simulation callers can enable forward_storage to have the storage
+    // metrics ride along with each owner-addressed report so a remote run can
+    // drive the report-driven eviction dimension.
     ErrorCode ReportMetricBatch(const MetricBatch& batch) override;
+
+    void set_forward_storage(bool forward) { forward_storage_ = forward; }
 
     // Sends an explicit prefetch plan to the SubMaster that owns the first
     // candidate; that SubMaster executes it through its local storage-safe
@@ -72,6 +77,7 @@ class CfmOwnershipClient final : public CfmClient {
     std::unordered_map<std::string, std::shared_ptr<CfmChannel>> channels_;
     mutable std::mutex channels_mutex_;
     std::atomic<uint64_t> dropped_observations_{0};
+    bool forward_storage_{false};
 };
 
 }  // namespace mooncake::io_pattern
