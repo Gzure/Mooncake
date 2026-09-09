@@ -5483,6 +5483,13 @@ auto MasterService::PutEndInternal(
         metadata.pending_replaced_quota_charge_bytes = 0;
     }
 
+    // Write-through offload legacy path: every completed MEMORY replica is
+    // queued to LOCAL_DISK right after PutEnd. This only runs in legacy mode
+    // (enable_offload=true without offload_on_evict). When offload-on-evict
+    // is enabled the block below is skipped: the new object stays in L1 and
+    // demotion happens at eviction time, where the IO Pattern policy selects
+    // the coldest L1 keys and EvictTenantMemoryForQuota demotes or releases
+    // them (lower-tier-backed keys are preferred victims).
     if (enable_offload_ && !offload_on_evict_) {
         auto& tenant_state = accessor.GetTenantState();
         metadata.VisitReplicas(
