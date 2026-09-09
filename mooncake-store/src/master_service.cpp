@@ -549,6 +549,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
                             << " freed=" << result.freed_bytes
                             << " evicted_objects=" << result.evicted_objects
                             << " candidate_keys=" << target.keys.size();
+                        size_t shown = 0;
+                        for (const auto& key : target.keys) {
+                            if (shown++ >= 3) break;
+                            LOG(WARNING)
+                                << "[IO-PATTERN-EVICT-DIAG]   candidate key="
+                                << key;
+                        }
                     }
                     LOG(WARNING)
                         << "[IO-PATTERN-EVICT-DIAG] io_pattern eviction "
@@ -9853,6 +9860,11 @@ MasterService::EvictTenantMemoryForQuota(
 
     auto pass = [&](bool allow_soft_pinned) {
         const size_t start_shard = randomIndex(kNumShards);
+        size_t diag_candidate_hits = 0;
+        size_t diag_candidate_skipped_pin = 0;
+        size_t diag_candidate_skipped_lease = 0;
+        size_t diag_candidate_skipped_replica = 0;
+        size_t diag_candidate_evicted = 0;
         for (size_t scanned = 0;
              scanned < kNumShards && total.freed_bytes < target_bytes;
              ++scanned) {
@@ -9878,15 +9890,31 @@ MasterService::EvictTenantMemoryForQuota(
                         !metadata.IsLeaseExpired(now) ||
                         (!allow_soft_pinned && metadata.IsSoftPinned(now)) ||
                         !can_evict_replicas(metadata)) {
+                        if (candidate_keys) {
+                            ++diag_candidate_hits;
+                            if (metadata.IsHardPinned() ||
+                                (!allow_soft_pinned &&
+                                 metadata.IsSoftPinned(now))) {
+                                ++diag_candidate_skipped_pin;
+                            } else if (!metadata.IsLeaseExpired(now)) {
+                                ++diag_candidate_skipped_lease;
+                            } else {
+                                ++diag_candidate_skipped_replica;
+                            }
+                        }
                         ++it;
                         continue;
                     }
+                    if (candidate_keys) ++diag_candidate_hits;
 
                     auto evict_result = try_evict_group_or_object(
                         it->first, metadata, tenant_state, deferred_replicas,
                         allow_soft_pinned);
                     total.freed_bytes += evict_result.freed_bytes;
                     total.evicted_objects += evict_result.evicted_objects;
+                    if (candidate_keys && evict_result.freed_bytes > 0) {
+                        ++diag_candidate_evicted;
+                    }
                     if (!metadata.IsValid()) {
                         it = EraseMetadata(tenant_state, it, normalized_tenant);
                     } else {
@@ -9897,6 +9925,20 @@ MasterService::EvictTenantMemoryForQuota(
                     shard->tenants.erase(tenant_it);
                 }
             }
+        }
+        if (candidate_keys) {
+            LOG(WARNING)
+                << "[IO-PATTERN-EVICT-DIAG] quota pass candidate scan "
+                   "tenant="
+                << normalized_tenant.value()
+                << " allow_soft_pinned=" << allow_soft_pinned
+                << " hits_in_metadata=" << diag_candidate_hits
+                << " skipped_pin=" << diag_candidate_skipped_pin
+                << " skipped_lease=" << diag_candidate_skipped_lease
+                << " skipped_no_evictable_replica="
+                << diag_candidate_skipped_replica
+                << " evicted=" << diag_candidate_evicted
+                << " freed_bytes=" << total.freed_bytes;
         }
     };
 
