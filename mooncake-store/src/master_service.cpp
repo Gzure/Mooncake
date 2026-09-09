@@ -542,7 +542,19 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                         total_freed
                                 ? std::numeric_limits<uint64_t>::max()
                                 : total_freed + result.freed_bytes;
+                        LOG(WARNING)
+                            << "[IO-PATTERN-EVICT-DIAG] io_pattern eviction "
+                               "tenant="
+                            << tenant.value() << " target=" << target.bytes
+                            << " freed=" << result.freed_bytes
+                            << " evicted_objects=" << result.evicted_objects
+                            << " candidate_keys=" << target.keys.size();
                     }
+                    LOG(WARNING)
+                        << "[IO-PATTERN-EVICT-DIAG] io_pattern eviction "
+                           "summary plan_target="
+                        << plan.target_bytes << " total_freed=" << total_freed
+                        << " candidates=" << plan.candidates.size();
                     return total_freed >= plan.target_bytes
                                ? ErrorCode::OK
                                : ErrorCode::OBJECT_NOT_FOUND;
@@ -9742,6 +9754,19 @@ MasterService::EvictTenantMemoryForQuota(
                                 OffloadingTask{replica.id(), now, client_id});
                         }
                         queued = true;
+                    } else {
+                        // Diagnostic: surface why offload-on-evict could not
+                        // enqueue this MEMORY replica (io_pattern quota
+                        // eviction path used by the report-driven cycle).
+                        LOG(WARNING)
+                            << "[IO-PATTERN-EVICT-DIAG] quota offload enqueue "
+                               "failed for key="
+                            << key << " tenant=" << normalized_tenant.value()
+                            << " error="
+                            << (result ? toString(result.error())
+                                       : "empty_result")
+                            << " replica_segments="
+                            << replica.get_segment_names().size();
                     }
                 });
 
@@ -10015,6 +10040,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             OffloadingTask{replica.id(), now, client_id});
                     }
                     queued = true;
+                } else {
+                    // Diagnostic: surface why the offload queue rejected this
+                    // MEMORY replica (empty result = no segment names on the
+                    // replica or no matching LOCAL_DISK holder).
+                    LOG(WARNING)
+                        << "[IO-PATTERN-EVICT-DIAG] BatchEvict offload enqueue "
+                           "failed for key="
+                        << key << " tenant=" << tenant_id.value()
+                        << " error="
+                        << (result ? toString(result.error()) : "empty_result")
+                        << " replica_segments="
+                        << replica.get_segment_names().size();
                 }
             });
 
