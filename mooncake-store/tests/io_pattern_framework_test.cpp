@@ -1363,19 +1363,28 @@ TEST(IoPatternFrameworkTest, FeedbackWindowAggregatesBoundedSamples) {
     window.Record({.hit_rate_delta = -0.4F, .prefetch_accuracy = 0.3F});
     const auto stats = window.Snapshot();
     EXPECT_EQ(stats.samples, 2);
-    EXPECT_FLOAT_EQ(stats.hit_rate_delta, (-0.2F - 0.4F) / 2.0F);
+    // Capacity 2 keeps the two most recent samples, i.e. the second and third
+    // records: (-0.4 + 0.1) / 2. The previous expectation averaged the first and
+    // third records, which no bounded window can produce.
+    EXPECT_FLOAT_EQ(stats.hit_rate_delta, (0.1F - 0.4F) / 2.0F);
     EXPECT_FLOAT_EQ(stats.prefetch_accuracy, (0.9F + 0.3F) / 2.0F);
 }
 
 TEST(IoPatternFrameworkTest, AdaptiveTunerChangesWeightsAfterNegativeStreak) {
     AdaptivePolicyTuner tuner(3);
     ScoreBasedEvictionConfig config;
-    EXPECT_FALSE(tuner.Tune({.hit_rate_delta = -0.1F}, config));
-    EXPECT_FALSE(tuner.Tune({.hit_rate_delta = -0.1F}, config));
-    EXPECT_TRUE(tuner.Tune({.hit_rate_delta = -0.1F}, config));
+    // prefetch_accuracy is stated explicitly: leaving it at its 0.0F default
+    // would trip the tuner's conservative branch (prefetch_accuracy < 0.2F) on
+    // the very first sample and the frequency/idle streak path would never run.
+    const PolicyFeedbackStats negative{.hit_rate_delta = -0.1F,
+                                       .prefetch_accuracy = 1.0F};
+    EXPECT_FALSE(tuner.Tune(negative, config));
+    EXPECT_FALSE(tuner.Tune(negative, config));
+    EXPECT_TRUE(tuner.Tune(negative, config));
     EXPECT_FLOAT_EQ(config.frequency_weight, 0.8F);
     EXPECT_FLOAT_EQ(config.idle_weight, 1.1F);
-    EXPECT_FALSE(tuner.Tune({.hit_rate_delta = 0.0F}, config));
+    EXPECT_FALSE(tuner.Tune({.hit_rate_delta = 0.0F, .prefetch_accuracy = 1.0F},
+                            config));
 }
 
 TEST(IoPatternFrameworkTest, AdaptiveTunerHandlesChurnAndPersistsChanges) {
@@ -1434,7 +1443,9 @@ TEST(IoPatternFrameworkTest, SlidingWindowAnalyzerComputesPercentiles) {
     EXPECT_EQ(analyzer.DetectWorkloadType(second), WorkloadType::kMixed);
     const auto stats = analyzer.FeatureStats();
     EXPECT_EQ(stats.samples, 2);
-    EXPECT_EQ(stats.token_median, 30);
+    // Percentile() ranks with size/2, so two samples select the upper-middle
+    // element: sorted {30, 20480} at index 1.
+    EXPECT_EQ(stats.token_median, 20480);
     EXPECT_EQ(stats.fanout_p90, 20);
     EXPECT_EQ(stats.block_p90, 300);
 }

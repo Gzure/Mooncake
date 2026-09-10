@@ -17,10 +17,27 @@ bool IsRecommendation(const KeyMetrics& key,
            key.access_count_window > config.recommendation_frequency;
 }
 
+// A code-agent key already satisfies the conversation dimensions (fanout and
+// match length), so conversation is scoped to the non-huge-context case.
+// Without that bound every code-agent key also matched this rule, matched > 1
+// forced kMixed, and kCodeAgent became unreachable under the default config.
 bool IsConversation(const KeyMetrics& key,
                     const ThresholdAnalyzerConfig& config) {
-    return key.prefix_fanout > config.conversation_prefix_fanout &&
+    return key.token_count <= config.code_agent_token_count &&
+           key.prefix_fanout > config.conversation_prefix_fanout &&
            key.match_length > config.conversation_match_length;
+}
+
+// Similarity of one reported dimension to a rule threshold. A dimension the key
+// does not report at all (zero) contributes nothing instead of acting as a
+// zero-similarity term: combining dimensions with std::min forced every partial
+// match to zero as soon as a single metric was absent, which is the common case
+// for a key observed through only one data path.
+float ReportedRatio(float value, float threshold) {
+    if (value <= 0.0F) {
+        return 0.0F;
+    }
+    return std::min(1.0F, value / std::max(1.0F, threshold));
 }
 
 float RuleConfidence(const KeyMetrics& key,
@@ -32,23 +49,30 @@ float RuleConfidence(const KeyMetrics& key,
     // A partial match is useful to policies, but must not look like a
     // definitive workload classification.
     if (score == 0.0F) {
-        const float code = std::min(
-            {static_cast<float>(key.token_count) /
-                 std::max(1.0F, static_cast<float>(config.code_agent_token_count)),
-             static_cast<float>(key.prefix_fanout) /
-                 std::max(1.0F, static_cast<float>(config.code_agent_prefix_fanout)),
-             static_cast<float>(key.match_length) /
-                 std::max(1.0F, static_cast<float>(config.code_agent_match_length))});
-        const float recommendation = std::min(
-            static_cast<float>(config.recommendation_block_size) /
-                std::max(1.0F, static_cast<float>(key.block_size)),
-             static_cast<float>(key.access_count_window) /
-                std::max(1.0F, static_cast<float>(config.recommendation_frequency)));
-        const float conversation = std::min(
-            static_cast<float>(key.prefix_fanout) /
-                std::max(1.0F, static_cast<float>(config.conversation_prefix_fanout)),
-            static_cast<float>(key.match_length) /
-                std::max(1.0F, static_cast<float>(config.conversation_match_length)));
+        const float code = std::max(
+            {ReportedRatio(static_cast<float>(key.token_count),
+                           static_cast<float>(config.code_agent_token_count)),
+             ReportedRatio(static_cast<float>(key.prefix_fanout),
+                           static_cast<float>(config.code_agent_prefix_fanout)),
+             ReportedRatio(static_cast<float>(key.match_length),
+                           static_cast<float>(config.code_agent_match_length))});
+        // The recommendation rule rewards a *small* block, so its block term is
+        // inverted; an unset block_size counts as unreported.
+        const float block_ratio =
+            key.block_size == 0
+                ? 0.0F
+                : std::min(1.0F,
+                           static_cast<float>(config.recommendation_block_size) /
+                               static_cast<float>(key.block_size));
+        const float recommendation = std::max(
+            block_ratio,
+            ReportedRatio(static_cast<float>(key.access_count_window),
+                          static_cast<float>(config.recommendation_frequency)));
+        const float conversation = std::max(
+            ReportedRatio(static_cast<float>(key.prefix_fanout),
+                          static_cast<float>(config.conversation_prefix_fanout)),
+            ReportedRatio(static_cast<float>(key.match_length),
+                          static_cast<float>(config.conversation_match_length)));
         score = std::clamp(std::max({code, recommendation, conversation}),
                            0.0F, 1.0F);
     }
