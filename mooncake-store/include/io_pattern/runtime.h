@@ -100,6 +100,10 @@ class IoPatternRuntime final {
         // refused. MasterService derives it from the same eviction high
         // watermark so admission stops before eviction starts.
         float admission_watermark_ratio{0.90F};
+        // Minimum accesses in the rolling window before admission into a
+        // non-HBM tier. Defaults to the ops default (2); 1 restores the previous
+        // admit-on-first-sight behaviour.
+        uint32_t admission_frequency_threshold{2};
         // After an eviction cycle the tier is considered relieved once this
         // ratio is reached; eviction target bytes are derived as
         // (peak_ratio - report_eviction_target_ratio) * capacity_bytes.

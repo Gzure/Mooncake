@@ -160,10 +160,12 @@ class WorkloadPolicyEngine final : public PolicyEngine {
    public:
     explicit WorkloadPolicyEngine(WorkloadType type = WorkloadType::kMixed,
                                   uint32_t transition_windows = 3,
-                                  float admission_watermark_ratio = 0.90F)
+                                  float admission_watermark_ratio = 0.90F,
+                                  uint32_t admission_frequency_threshold = 2)
         : transition_windows_(transition_windows), workload_type_(type),
           previous_type_(type),
-          admission_watermark_ratio_(admission_watermark_ratio) {
+          admission_watermark_ratio_(admission_watermark_ratio),
+          admission_frequency_threshold_(admission_frequency_threshold) {
         Configure(type);
     }
 
@@ -309,6 +311,9 @@ class WorkloadPolicyEngine final : public PolicyEngine {
         ScoreBasedEvictionConfig eviction =
             eviction_override.value_or(EvictionConfigFor(type));
         PrefixMatchAdmissionConfig admission;
+        // Applied before the per-workload switch, so a template that states its
+        // own frequency gate (generative recommendation) still wins.
+        admission.frequency_threshold = admission_frequency_threshold_;
         TraceBasedPrefetchConfig prefetch;
         switch (type) {
             case WorkloadType::kCodeAgent:
@@ -362,6 +367,7 @@ class WorkloadPolicyEngine final : public PolicyEngine {
     ScoreBasedEvictionConfig active_eviction_;
     ScoreBasedEvictionConfig previous_eviction_;
     float admission_watermark_ratio_{0.90F};
+    uint32_t admission_frequency_threshold_{2};
 };
 
 }  // namespace mooncake::io_pattern
