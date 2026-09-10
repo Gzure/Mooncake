@@ -89,6 +89,9 @@ class SnapshotChildProcessTest;
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
 class MasterServiceHATest;
+// Friended so the offload-on-evict tests can drive the legacy eviction fallback
+// that the IO Pattern eviction handler runs when a plan under-delivers.
+class OffloadOnEvictTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
