@@ -1798,7 +1798,9 @@ TEST(IoPatternFrameworkTest, UnavailablePrefetchCapabilityDoesNotDegradePolicy) 
 
     AccessRecord access{.object = {TenantId("tenant-a"), "cold-key"},
                         .block_size = 1024,
-                        .tier = CacheTier::kL3NofSsd,
+                        // Local disk is the only tier the store can promote from,
+                        // and the only one that yields a prefetch candidate.
+                        .tier = CacheTier::kLocalDisk,
                         .operation = IoOperation::kGet,
                         .is_hit = true};
     // A recommendation-shaped key yields a definitive workload classification
