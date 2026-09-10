@@ -37,6 +37,12 @@ class IoPatternCollectorImpl final : public IoPatternCollector {
     // Ingests a CFM snapshot without replaying it through the asynchronous
     // reporter. The sender is already the reporting side of that pipeline.
     void MergeSnapshot(const IoPatternSnapshot& snapshot);
+    // Applies an authoritative tier transition reported by the owner of the
+    // replica metadata (insert, removal, or move between tiers). This is how a
+    // tier bit stops being claimed once the replica is actually gone. Presence
+    // must not be inferred from access recency: a cold key that has simply not
+    // been read has to stay eligible for eviction.
+    void RecordTierEvent(const CacheEvent& event);
     IoPatternSnapshot GetSnapshot() const override;
     uint64_t dropped() const;
     bool degraded() const;

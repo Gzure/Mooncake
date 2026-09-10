@@ -1791,5 +1791,56 @@ TEST(IoPatternFrameworkTest, UnavailablePrefetchCapabilityDoesNotDegradePolicy) 
            "failure";
 }
 
+TEST(IoPatternFrameworkTest, TierRemovalEventRetiresTheReplicaBit) {
+    // An object evicted from host memory must stop claiming an L1 replica, so
+    // it becomes promotable again instead of being treated as already resident
+    // in the head tier.
+    IoPatternRuntime runtime(
+        {.eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+         .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+         .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
+    AccessRecord access{.object = {TenantId("tenant-a"), "tiered-key"},
+                        .block_size = 64,
+                        .tier = CacheTier::kL1Host,
+                        .is_hit = true};
+    runtime.RecordAccess(access.object.key, access);
+    ASSERT_EQ(runtime.Snapshot().keys.size(), 1U);
+    EXPECT_EQ(runtime.Snapshot().keys.front().replica_tiers,
+              CacheTierBit(CacheTier::kL1Host));
+
+    runtime.RecordTierEvent(CacheEvent{.type = CacheEventType::kRemoved,
+                                       .object = access.object,
+                                       .source_tier = CacheTier::kL1Host});
+
+    EXPECT_EQ(runtime.Snapshot().keys.front().replica_tiers,
+              static_cast<CacheTierMask>(0));
+}
+
+TEST(IoPatternFrameworkTest, TierChangeEventMovesTheReplicaBit) {
+    // Demotion keeps the lower-tier claim without keeping the upper one; a
+    // fresh insert adds a claim.
+    IoPatternCollectorImpl collector;
+    AccessRecord access{.object = {TenantId("tenant-a"), "moved-key"},
+                        .block_size = 64,
+                        .tier = CacheTier::kL1Host,
+                        .is_hit = true};
+    collector.RecordAccess(access.object.key, access);
+
+    collector.RecordTierEvent(
+        CacheEvent{.type = CacheEventType::kTierChanged,
+                   .object = access.object,
+                   .source_tier = CacheTier::kL1Host,
+                   .target_tier = CacheTier::kL3NofSsd});
+    EXPECT_EQ(collector.GetSnapshot().keys.front().replica_tiers,
+              CacheTierBit(CacheTier::kL3NofSsd));
+
+    collector.RecordTierEvent(CacheEvent{.type = CacheEventType::kInserted,
+                                         .object = access.object,
+                                         .target_tier = CacheTier::kL2Segment});
+    EXPECT_EQ(collector.GetSnapshot().keys.front().replica_tiers,
+              static_cast<CacheTierMask>(CacheTierBit(CacheTier::kL3NofSsd) |
+                                         CacheTierBit(CacheTier::kL2Segment)));
+}
+
 }  // namespace
 }  // namespace mooncake::io_pattern

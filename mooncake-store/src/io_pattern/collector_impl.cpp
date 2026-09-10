@@ -218,6 +218,41 @@ void IoPatternCollectorImpl::MergeSnapshot(const IoPatternSnapshot& snapshot) {
     }
 }
 
+void IoPatternCollectorImpl::RecordTierEvent(const CacheEvent& event) {
+    if (event.type == CacheEventType::kUnknown) {
+        return;
+    }
+    std::lock_guard lock(mutex_);
+    const auto it = key_metrics_.find(event.object);
+    if (it == key_metrics_.end()) {
+        return;
+    }
+    const auto with_tier = [](CacheTierMask mask, CacheTier tier,
+                              bool present) -> CacheTierMask {
+        const CacheTierMask bit = CacheTierBit(tier);
+        return present ? static_cast<CacheTierMask>(mask | bit)
+                       : static_cast<CacheTierMask>(mask & ~bit);
+    };
+    switch (event.type) {
+        case CacheEventType::kInserted:
+            it->second.replica_tiers =
+                with_tier(it->second.replica_tiers, event.target_tier, true);
+            break;
+        case CacheEventType::kRemoved:
+            it->second.replica_tiers =
+                with_tier(it->second.replica_tiers, event.source_tier, false);
+            break;
+        case CacheEventType::kTierChanged:
+            it->second.replica_tiers =
+                with_tier(it->second.replica_tiers, event.source_tier, false);
+            it->second.replica_tiers =
+                with_tier(it->second.replica_tiers, event.target_tier, true);
+            break;
+        case CacheEventType::kUnknown:
+            return;
+    }
+}
+
 IoPatternSnapshot IoPatternCollectorImpl::GetSnapshot() const {
     std::lock_guard lock(mutex_);
     IoPatternSnapshot snapshot;

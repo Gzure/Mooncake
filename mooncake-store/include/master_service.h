@@ -124,6 +124,7 @@ class MasterService {
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
     friend class test::MasterServiceHATest;
+    friend class test::OffloadOnEvictTest;
 
    public:
     using NoFProbeFn =
@@ -1024,6 +1025,22 @@ class MasterService {
         const TenantId& tenant_id, uint64_t target_bytes,
         const std::unordered_set<std::string>* candidate_keys = nullptr);
 
+    // After an eviction pass, reports a kRemoved tier event for every candidate
+    // key whose MEMORY replica is actually gone, so the IO Pattern collector
+    // stops claiming an L1 replica for it. Presence is read from authoritative
+    // metadata rather than inferred from access recency: an evicted key must
+    // become promotable again, while a cold key that has simply not been read
+    // must stay eligible for eviction.
+    void ReportEvictedKeysAsTierRemovals(
+        const TenantId& tenant,
+        const std::unordered_set<std::string>& candidate_keys);
+
+    // Runs the legacy lease-ordered eviction for an IO Pattern plan that could
+    // not free its byte target (stale candidates, active leases, pins, or an
+    // empty candidate set), so a watermark request still makes progress.
+    // Returns true when the fallback ran.
+    bool RunLegacyEvictionFallback(uint64_t shortfall_bytes);
+
     // Helper to get a snapshot of alive clients (under client_mutex_ shared
     // lock)
     std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
@@ -1819,6 +1836,10 @@ class MasterService {
     // Eviction thread related members
     std::thread eviction_thread_;
     std::atomic<bool> eviction_running_{false};
+    // Serializes legacy eviction fallbacks: the watermark thread and the
+    // report-driven worker can both observe a shortfall, and BatchEvict has no
+    // re-entrancy protection.
+    std::mutex legacy_eviction_mutex_;
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 

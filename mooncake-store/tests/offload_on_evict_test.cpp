@@ -23,6 +23,15 @@ class OffloadOnEvictTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
+    // Friend access to the private legacy-eviction fallback, which the runtime's
+    // eviction handler runs when an IO Pattern plan cannot free its byte target.
+    // OffloadOnEvictTest is friended; TEST_F-generated subclasses are not, hence
+    // this static funnel.
+    static bool RunLegacyEvictionFallbackForTesting(MasterService* service,
+                                                    uint64_t shortfall_bytes) {
+        return service->RunLegacyEvictionFallback(shortfall_bytes);
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     Segment MakeSegment(std::string name, size_t base, size_t size) const {
@@ -422,6 +431,29 @@ TEST_F(OffloadOnEvictTest, BatchRemoveDropsOffloadingObjectsMirror) {
         << "OffloadObjectHeartbeat returned " << queued.size()
         << " stale entries after BatchRemove; EraseMetadata failed to clean "
            "offloading_objects.";
+}
+
+// The runtime's eviction handler falls back to the legacy lease-ordered
+// eviction when an IO Pattern plan cannot free its byte target. That path is
+// what keeps a watermark request making progress when the plan's candidates are
+// stale, leased, pinned, or empty -- the report-driven worker relies on it
+// because it has no eviction thread of its own.
+TEST_F(OffloadOnEvictTest, LegacyEvictionFallbackRunsForUnderDeliveringPlan) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 100;
+    auto service = std::make_unique<MasterService>(config);
+    auto ctx = PrepareSegment(*service, "fallback-segment", kDefaultSegmentBase,
+                              8 * 1024 * 1024);
+    for (int i = 0; i < 8; ++i) {
+        PutObject(*service, ctx.client_id, "fb-" + std::to_string(i), 4096);
+    }
+
+    // No shortfall is a no-op and reports success.
+    EXPECT_TRUE(RunLegacyEvictionFallbackForTesting(service.get(), 0));
+
+    // A real shortfall runs the legacy path: the segment is mounted, so a
+    // capacity is known and the guard mutex is free.
+    EXPECT_TRUE(RunLegacyEvictionFallbackForTesting(service.get(), 1));
 }
 
 }  // namespace mooncake::test

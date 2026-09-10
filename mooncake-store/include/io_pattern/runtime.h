@@ -62,6 +62,11 @@ class IoPatternRuntime final {
         size_t admission_candidates{0};
         size_t admissions_admitted{0};
         ErrorCode admission_status{ErrorCode::OK};
+        // Dimensions whose storage handler declined to act because the
+        // primitive cannot run in the current mode (promotion disabled, no
+        // lower-tier source replica, HBM refusal). Such a skip is expected and
+        // is not counted as a policy failure.
+        size_t skipped_dimensions{0};
     };
     using ReportDrivenObserver =
         std::function<void(const ReportDrivenCycleReport&)>;
@@ -123,6 +128,9 @@ class IoPatternRuntime final {
     void RecordAccess(const std::string& key, const AccessRecord& record);
     void RecordStorageMetric(const StorageMetric& metric);
     void MergeSnapshot(const IoPatternSnapshot& snapshot);
+    // Applies an authoritative tier transition reported by the owner of the
+    // replica metadata. See IoPatternCollectorImpl::RecordTierEvent.
+    void RecordTierEvent(const CacheEvent& event);
     bool FlushReports();
     void StopReports();
 

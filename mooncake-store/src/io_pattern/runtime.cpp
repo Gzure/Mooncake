@@ -160,6 +160,10 @@ void IoPatternRuntime::MergeSnapshot(const IoPatternSnapshot& snapshot) {
     }
 }
 
+void IoPatternRuntime::RecordTierEvent(const CacheEvent& event) {
+    collector_->RecordTierEvent(event);
+}
+
 bool IoPatternRuntime::FlushReports() { return collector_->FlushReports(); }
 
 void IoPatternRuntime::StopReports() { collector_->StopReports(); }
@@ -539,6 +543,7 @@ void IoPatternRuntime::RunReportDrivenCycle() {
     report.degraded = status.degraded || planned.result.degraded;
     report.eviction_status = status.eviction;
     report.prefetch_status = status.prefetch;
+    report.skipped_dimensions = status.skipped;
     if (!status.admissions.empty()) {
         report.admission_status = status.admissions.front();
     }

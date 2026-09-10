@@ -500,6 +500,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << " keys_analyzed=" << rpt.keys_analyzed
                       << " analysis_elapsed_us=" << rpt.analysis_elapsed_us
                       << " degraded=" << rpt.degraded
+                      << " skipped=" << rpt.skipped_dimensions
                       << " eviction(tier="
                       << static_cast<int>(rpt.eviction_tier)
                       << ", bytes=" << rpt.eviction_target_bytes
@@ -551,8 +552,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
                         std::unordered_set<std::string> keys;
                     };
                     if (plan.target_bytes == 0) return ErrorCode::OK;
-                    if (plan.candidates.empty())
-                        return ErrorCode::OBJECT_NOT_FOUND;
                     uint64_t total_freed = 0;
                     std::unordered_map<TenantId, TenantCandidates, TenantIdHash>
                         targets;
@@ -584,13 +583,29 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                 << "[IO-PATTERN-EVICT-DIAG]   candidate key="
                                 << key;
                         }
+                        ReportEvictedKeysAsTierRemovals(tenant, target.keys);
                     }
                     LOG(WARNING)
                         << "[IO-PATTERN-EVICT-DIAG] io_pattern eviction "
                            "summary plan_target="
                         << plan.target_bytes << " total_freed=" << total_freed
                         << " candidates=" << plan.candidates.size();
-                    return total_freed >= plan.target_bytes
+                    if (total_freed >= plan.target_bytes) {
+                        return ErrorCode::OK;
+                    }
+                    // The plan under-delivered: its candidates may be stale, may
+                    // still hold leases or pins, or may be empty. Fall back to
+                    // the legacy lease-ordered eviction so the watermark request
+                    // still makes progress. This covers both the local watermark
+                    // thread and the report-driven worker, which is why the
+                    // thread no longer runs its own fallback.
+                    const uint64_t shortfall = plan.target_bytes - total_freed;
+                    LOG(WARNING)
+                        << "[IO-PATTERN-EVICT-FALLBACK] policy plan under-"
+                           "delivered plan_target="
+                        << plan.target_bytes << " freed=" << total_freed
+                        << " shortfall=" << shortfall;
+                    return RunLegacyEvictionFallback(shortfall)
                                ? ErrorCode::OK
                                : ErrorCode::OBJECT_NOT_FOUND;
                 },
@@ -8193,6 +8208,18 @@ auto MasterService::NotifyOffloadSuccess(
             local_disk_segment->ssd_used_bytes.fetch_add(
                 metadata.data_size, std::memory_order_relaxed);
         }
+        if (added_new_local_disk_replica && io_pattern_runtime_) {
+            // The object now holds a durable lower-tier replica, so record it:
+            // once its MEMORY replica is reclaimed the key must be promotable
+            // again instead of looking like it has no replica at all. LOCAL_DISK
+            // is reported under kL3NofSsd until CacheTier grows a dedicated
+            // member for it.
+            io_pattern_runtime_->RecordTierEvent(
+                io_pattern::CacheEvent{
+                    .type = io_pattern::CacheEventType::kInserted,
+                    .object = {object_id.tenant_id, object_id.user_key},
+                    .target_tier = io_pattern::CacheTier::kL3NofSsd});
+        }
     }
 
     return {};
@@ -9102,9 +9129,11 @@ void MasterService::EvictionThreadFunc() {
                 const auto status = io_pattern_runtime_->Execute(
                     io_pattern::CacheTier::kL1Host,
                     static_cast<uint64_t>(evict_ratio_target * capacity), {});
-                if (status.eviction != ErrorCode::OK) {
-                    BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
-                }
+                // A shortfall is already handled inside the runtime's eviction
+                // handler (RunLegacyEvictionFallback), which also covers the
+                // report-driven worker; running BatchEvict again here would
+                // evict twice for one watermark breach.
+                (void)status;
             } else {
                 BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
             }
@@ -9705,6 +9734,52 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
     return {};
 }
 
+void MasterService::ReportEvictedKeysAsTierRemovals(
+    const TenantId& tenant,
+    const std::unordered_set<std::string>& candidate_keys) {
+    if (!io_pattern_runtime_ || candidate_keys.empty()) {
+        return;
+    }
+    for (const auto& key : candidate_keys) {
+        const ObjectIdentity object_id{tenant, key};
+        MetadataAccessorRO accessor(this, object_id);
+        if (accessor.Exists() && accessor.Get().HasMemReplica()) {
+            continue;
+        }
+        // The MEMORY replica is gone, so the policy must stop treating this key
+        // as already resident in the head tier; otherwise it is never offered
+        // to admission and never promoted back.
+        io_pattern_runtime_->RecordTierEvent(
+            io_pattern::CacheEvent{
+                .type = io_pattern::CacheEventType::kRemoved,
+                .object = {tenant, key},
+                .source_tier = io_pattern::CacheTier::kL1Host});
+    }
+}
+
+bool MasterService::RunLegacyEvictionFallback(uint64_t shortfall_bytes) {
+    if (shortfall_bytes == 0) {
+        return true;
+    }
+    const auto capacity = std::max<int64_t>(
+        0, MasterMetricManager::instance().get_total_mem_capacity());
+    if (capacity == 0) {
+        return false;
+    }
+    // Only one fallback at a time: the watermark thread and the report-driven
+    // worker can both observe a shortfall, and BatchEvict has no re-entrancy
+    // protection.
+    std::unique_lock<std::mutex> lock(legacy_eviction_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return false;
+    }
+    const double ratio =
+        std::min(1.0, static_cast<double>(shortfall_bytes) /
+                          static_cast<double>(capacity));
+    BatchEvict(ratio, ratio * 0.5);
+    return true;
+}
+
 MasterService::TenantQuotaEvictionResult
 MasterService::EvictTenantMemoryForQuota(
     const TenantId& tenant_id, uint64_t target_bytes,
@@ -9939,16 +10014,15 @@ MasterService::EvictTenantMemoryForQuota(
                                 bool diag_any_refcnt = false;
                                 bool diag_any_unreadable = false;
                                 metadata.VisitReplicas(
-                                    [&](const Replica& r) {
-                                        if (r.is_memory_replica()) {
-                                            diag_has_mem = true;
-                                            if (!r.is_completed())
-                                                diag_all_completed = false;
-                                            if (r.get_refcnt() != 0)
-                                                diag_any_refcnt = true;
-                                            if (!IsReplicaReadable(r))
-                                                diag_any_unreadable = true;
-                                        }
+                                    &Replica::fn_is_memory_replica,
+                                    [&](Replica& r) {
+                                        diag_has_mem = true;
+                                        if (!r.is_completed())
+                                            diag_all_completed = false;
+                                        if (r.get_refcnt() != 0)
+                                            diag_any_refcnt = true;
+                                        if (!IsReplicaReadable(r))
+                                            diag_any_unreadable = true;
                                     });
                                 diag_no_evictable_has_mem += diag_has_mem;
                                 diag_no_evictable_completed +=
