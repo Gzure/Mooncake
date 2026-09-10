@@ -941,10 +941,17 @@ TEST(IoPatternFrameworkTest, InProcessTransportDoesNotHoldLockAcrossHandler) {
     std::promise<void> handler_entered;
     std::promise<void> release_handler;
     auto release = release_handler.get_future().share();
+    // Only the first invocation blocks and signals entry: the test deliberately
+    // issues a second concurrent Send, and re-satisfying the promise from that
+    // invocation would throw std::future_error inside the handler and abort the
+    // process instead of proving that the transport lock is not held across it.
+    std::atomic<int> handler_calls{0};
     auto transport = std::make_shared<InProcessCfmRpcTransport>(
         [&](std::string_view, std::string_view) {
-            handler_entered.set_value();
-            release.wait();
+            if (handler_calls.fetch_add(1) == 0) {
+                handler_entered.set_value();
+                release.wait();
+            }
             return true;
         });
 
