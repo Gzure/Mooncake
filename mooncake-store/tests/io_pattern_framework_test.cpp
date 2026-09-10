@@ -1403,19 +1403,19 @@ TEST(IoPatternFrameworkTest, SlidingWindowAnalyzerComputesPercentiles) {
     IoPatternSnapshot first;
     first.generated_at_ns = 10;
     first.keys.push_back(KeyMetrics{.object = {TenantId("tenant"), "first"},
+                                    .access_count_window = 1,
+                                    .block_size = 100,
                                     .token_count = 20 * 1024,
                                     .prefix_fanout = 20,
-                                    .match_length = 512,
-                                    .block_size = 100,
-                                    .access_count_window = 1});
+                                    .match_length = 512});
     IoPatternSnapshot second;
     second.generated_at_ns = 50;
     second.keys.push_back(KeyMetrics{.object = {TenantId("tenant"), "second"},
+                                     .access_count_window = 5,
+                                     .block_size = 300,
                                      .token_count = 30,
                                      .prefix_fanout = 20,
-                                     .match_length = 300,
-                                     .block_size = 300,
-                                     .access_count_window = 5});
+                                     .match_length = 300});
     EXPECT_EQ(analyzer.DetectWorkloadType(second), WorkloadType::kMixed);
     const auto stats = analyzer.FeatureStats();
     EXPECT_EQ(stats.samples, 2);
@@ -1431,9 +1431,9 @@ TEST(IoPatternFrameworkTest, SlidingWindowDeduplicatesObjectsAndBoundsHistory) {
         IoPatternSnapshot snapshot;
         snapshot.generated_at_ns = timestamp;
         snapshot.keys.push_back(KeyMetrics{.object = object,
+                                           .access_count_window = timestamp,
                                            .token_count =
-                                               static_cast<uint32_t>(timestamp),
-                                           .access_count_window = timestamp});
+                                               static_cast<uint32_t>(timestamp)});
         analyzer.Analyze(snapshot);
     }
 
@@ -1469,8 +1469,8 @@ TEST(IoPatternFrameworkTest, KMeansFallbackLabelsIndependentSessions) {
                    .match_length = 512},
         KeyMetrics{.object = {TenantId("tenant-b"), "small"},
                    .session_id = "recommendation-session",
-                   .block_size = 64 * 1024,
-                   .access_count_window = 30},
+                   .access_count_window = 30,
+                   .block_size = 64 * 1024},
     };
 
     const auto result = analyzer.Analyze(snapshot);
