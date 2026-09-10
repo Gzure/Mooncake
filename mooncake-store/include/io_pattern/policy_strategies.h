@@ -35,7 +35,11 @@ class ScoreBasedEvictionOps final : public EvictionOps {
 
 struct PrefixMatchAdmissionConfig {
     uint32_t hbm_match_length{64};
-    uint64_t frequency_threshold{1};
+    // Minimum accesses in the rolling window before an object may be admitted to
+    // a non-HBM tier. Defaults to 2, matching the master's own
+    // promotion_admission_threshold second-touch gate; a threshold of 1 admitted
+    // on first sight and made this gate a no-op.
+    uint64_t frequency_threshold{2};
     float max_memory_used_ratio{0.90F};
 };
 

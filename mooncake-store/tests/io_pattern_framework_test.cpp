@@ -1674,6 +1674,10 @@ TEST(IoPatternFrameworkTest, RuntimeConnectsCollectionAnalysisPolicyAndHandlers)
                         .block_size = 64,
                         .tier = CacheTier::kL2Segment,
                         .is_hit = true};
+    // Two accesses: the default admission frequency gate is 2, aligned with the
+    // master's promotion_admission_threshold. A single observation would be
+    // rejected for frequency instead of exercising the handler.
+    runtime.RecordAccess(access.object.key, access);
     runtime.RecordAccess(access.object.key, access);
     runtime.ReportInferenceMetrics(
         InferenceMetrics{.object = access.object, .match_length = 512});
@@ -1720,6 +1724,9 @@ TEST(IoPatternFrameworkTest, RuntimeSchedulesAdmissionOffTheProducerPath) {
     AccessRecord access{.object = {TenantId("tenant"), "disk-key"},
                         .tier = CacheTier::kL3NofSsd,
                         .operation = IoOperation::kPut};
+    // The default admission frequency gate is 2, so two observations are needed
+    // before the admission handler is reached.
+    runtime.RecordAccess(access.object.key, access);
     runtime.RecordAccess(access.object.key, access);
 
     EXPECT_TRUE(runtime.ScheduleAdmission(access.object, CacheTier::kL1Host));
