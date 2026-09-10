@@ -8213,11 +8213,14 @@ auto MasterService::NotifyOffloadSuccess(
             // once its MEMORY replica is reclaimed the key must be promotable
             // again instead of looking like it has no replica at all. LOCAL_DISK
             // is reported under kL3NofSsd until CacheTier grows a dedicated
-            // member for it.
+            // member for it. The per-object identity resolved inside the add
+            // branch is scoped to that branch, so use the loop-level request
+            // identity here.
             io_pattern_runtime_->RecordTierEvent(
                 io_pattern::CacheEvent{
                     .type = io_pattern::CacheEventType::kInserted,
-                    .object = {object_id.tenant_id, object_id.user_key},
+                    .object = {request_object_id.tenant_id,
+                               request_object_id.user_key},
                     .target_tier = io_pattern::CacheTier::kL3NofSsd});
         }
     }
