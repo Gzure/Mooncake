@@ -23,11 +23,17 @@ const KeyMetrics* FindMetrics(const ObjectRef& object,
     return it == snapshot.keys.end() ? nullptr : &*it;
 }
 
+// Whether the object already has a replica deeper in the storage ladder, which
+// is what makes evicting this copy safe. Compared by TierDepth rather than by
+// enum value: kLocalDisk is declared last for wire compatibility but sits
+// directly below host memory, so index order is not storage order.
 bool HasLowerTierReplica(const KeyMetrics& key, CacheTier tier) {
-    const auto tier_index = static_cast<uint8_t>(tier);
-    for (uint8_t index = tier_index + 1;
-         index <= static_cast<uint8_t>(CacheTier::kL3NofSsd); ++index) {
-        if (key.replica_tiers & static_cast<CacheTierMask>(1U << index)) {
+    const int depth = TierDepth(tier);
+    for (const CacheTier candidate : kAllCacheTiers) {
+        if (TierDepth(candidate) <= depth) {
+            continue;
+        }
+        if (key.replica_tiers & CacheTierBit(candidate)) {
             return true;
         }
     }
@@ -40,7 +46,10 @@ CacheTier TierDownTarget(CacheTier source, TierDownMode mode) {
         return CacheTier::kL2Segment;
     }
     // Prefix-affinity keeps the immediate next tier as the placement target;
-    // callers may co-locate grouped prefixes within that tier.
+    // callers may co-locate grouped prefixes within that tier. kLocalDisk is not
+    // reachable from here: it is appended last for wire compatibility, and the
+    // MEMORY -> LOCAL_DISK demotion is selected explicitly by the tier-down
+    // driver rather than derived from this ladder.
     return static_cast<CacheTier>(static_cast<uint8_t>(source) + 1);
 }
 
@@ -86,6 +95,9 @@ EvictionPlan ScoreBasedEvictionOps::Evaluate(const PolicyContext& context,
                         config_.recompute_weight * pattern->recompute_score;
                 break;
             case CacheTier::kL1Host:
+            // Host-local SSD is scored like host memory: idle time dominates,
+            // and an existing deeper replica makes reclaiming it safe.
+            case CacheTier::kLocalDisk:
             case CacheTier::kL2Segment:
                 score = config_.idle_weight * pattern->idle_score -
                         config_.frequency_weight * pattern->frequency_score +

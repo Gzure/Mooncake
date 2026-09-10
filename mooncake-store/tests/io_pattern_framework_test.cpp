@@ -1879,5 +1879,30 @@ TEST(IoPatternFrameworkTest, TierChangeEventMovesTheReplicaBit) {
                                          CacheTierBit(CacheTier::kL2Segment)));
 }
 
+TEST(IoPatternFrameworkTest, LocalDiskCountsAsALowerTierThanHostMemory) {
+    // TierDepth, not declaration order, defines the storage ladder: kLocalDisk is
+    // declared last so the existing tier values stay stable on the CFI wire.
+    EXPECT_LT(TierDepth(CacheTier::kL1Host), TierDepth(CacheTier::kLocalDisk));
+    EXPECT_LT(TierDepth(CacheTier::kLocalDisk), TierDepth(CacheTier::kL2Segment));
+    EXPECT_LT(TierDepth(CacheTier::kL2Segment), TierDepth(CacheTier::kL3NofSsd));
+
+    // A local-disk copy is what makes reclaiming the host copy safe, which is
+    // exactly what the eviction score's lower-replica term rewards.
+    ScoreBasedEvictionOps eviction;
+    PolicyContext context;
+    KeyMetrics key;
+    key.object = {TenantId("tenant-a"), "offloaded"};
+    key.block_size = 64;
+    key.replica_tiers = CacheTierBit(CacheTier::kL1Host) |
+                        CacheTierBit(CacheTier::kLocalDisk);
+    context.snapshot.keys.push_back(key);
+    context.analysis.keys = {KeyPattern{.object = key.object, .idle_score = 1.0F}};
+
+    const auto plan = eviction.Evaluate(context, CacheTier::kL1Host, 64);
+    ASSERT_EQ(plan.candidates.size(), 1);
+    // idle_weight(1.0) * idle_score(1.0) + lower_replica_weight(1.0) * 1.0.
+    EXPECT_FLOAT_EQ(plan.candidates.front().score, 2.0F);
+}
+
 }  // namespace
 }  // namespace mooncake::io_pattern

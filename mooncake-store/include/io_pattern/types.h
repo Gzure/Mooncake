@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <variant>
@@ -14,12 +15,42 @@ enum class CacheTier : uint8_t {
     kL1Host = 1,
     kL2Segment = 2,
     kL3NofSsd = 3,
+    // Client-local SSD, which is the store's only promotable lower tier
+    // (LOCAL_DISK -> MEMORY). Appended last so the numeric values of the
+    // existing tiers stay stable for the CFM wire format.
+    kLocalDisk = 4,
 };
 
 using CacheTierMask = uint8_t;
 
 constexpr CacheTierMask CacheTierBit(CacheTier tier) {
     return static_cast<CacheTierMask>(1U << static_cast<uint8_t>(tier));
+}
+
+// Every tier, so callers do not have to assume that declaration order is also
+// storage order.
+inline constexpr std::array<CacheTier, 5> kAllCacheTiers{
+    CacheTier::kL0Hbm, CacheTier::kL1Host, CacheTier::kLocalDisk,
+    CacheTier::kL2Segment, CacheTier::kL3NofSsd};
+
+// Distance from the compute along the storage ladder, for decisions that need a
+// "closer to the head tier" comparison. Declaration order is deliberately not
+// this order: kLocalDisk is appended last for wire compatibility but sits
+// directly below host memory, above the pooled segment and NoF tiers.
+constexpr int TierDepth(CacheTier tier) {
+    switch (tier) {
+        case CacheTier::kL0Hbm:
+            return 0;
+        case CacheTier::kL1Host:
+            return 1;
+        case CacheTier::kLocalDisk:
+            return 2;
+        case CacheTier::kL2Segment:
+            return 3;
+        case CacheTier::kL3NofSsd:
+            return 4;
+    }
+    return 4;
 }
 
 enum class IoOperation : uint8_t {
