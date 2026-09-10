@@ -169,6 +169,17 @@ struct MasterConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: copy a selected object down to local disk while
+    // keeping its MEMORY replica (tier down is a copy, not a reclaim), bounded by
+    // a per-cycle byte budget. A zero budget disables the driver.
+    bool io_pattern_tier_down = false;
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     // Max promotion tasks PromotionObjectHeartbeat returns to a single
     // client per call. Each task is a synchronous SSD-read + RDMA-write
     // on the client; serializing them avoids blocking past the client-
@@ -291,6 +302,17 @@ class MasterServiceSupervisorConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: copy a selected object down to local disk while
+    // keeping its MEMORY replica (tier down is a copy, not a reclaim), bounded by
+    // a per-cycle byte budget. A zero budget disables the driver.
+    bool io_pattern_tier_down = false;
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
     // Report-driven cold-data eviction driver (embedded CFM component).
     // Mirrors MasterConfig / WrappedMasterServiceConfig; carried through the
@@ -357,6 +379,13 @@ class MasterServiceSupervisorConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down = config.io_pattern_tier_down;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
@@ -563,6 +592,17 @@ class WrappedMasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: copy a selected object down to local disk while
+    // keeping its MEMORY replica (tier down is a copy, not a reclaim), bounded by
+    // a per-cycle byte budget. A zero budget disables the driver.
+    bool io_pattern_tier_down = false;
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
@@ -673,6 +713,13 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down = config.io_pattern_tier_down;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
@@ -802,6 +849,13 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down = config.io_pattern_tier_down;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
@@ -1277,6 +1331,17 @@ class MasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
+    // Policy-driven tier down: copy a selected object down to local disk while
+    // keeping its MEMORY replica (tier down is a copy, not a reclaim), bounded by
+    // a per-cycle byte budget. A zero budget disables the driver.
+    bool io_pattern_tier_down = false;
+    uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
+    // Admission gates. The frequency threshold defaults to 2, matching the
+    // master's own second-touch promotion gate; 1 restores the previous
+    // admit-on-first-sight behaviour. A negative watermark means "derive it from
+    // eviction_high_watermark_ratio", so admission stops before eviction starts.
+    uint32_t io_pattern_admission_frequency_threshold = 2;
+    double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
@@ -1384,6 +1449,13 @@ class MasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
+        io_pattern_tier_down = config.io_pattern_tier_down;
+        io_pattern_tier_down_bytes_per_cycle =
+            config.io_pattern_tier_down_bytes_per_cycle;
+        io_pattern_admission_frequency_threshold =
+            config.io_pattern_admission_frequency_threshold;
+        io_pattern_admission_watermark_ratio =
+            config.io_pattern_admission_watermark_ratio;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
