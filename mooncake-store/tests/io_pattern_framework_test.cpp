@@ -1440,6 +1440,12 @@ TEST(IoPatternFrameworkTest, SlidingWindowAnalyzerComputesPercentiles) {
                                      .token_count = 30,
                                      .prefix_fanout = 20,
                                      .match_length = 300});
+    // Both snapshots must reach the analyzer: the aggregate has to hold two
+    // samples for kMixed (one code-agent shaped key, one conversation shaped
+    // key), and the percentile expectations below are computed over both. The
+    // first snapshot was previously built and then never fed to the analyzer,
+    // which left a single sample and made the kMixed expectation unreachable.
+    analyzer.Analyze(first);
     EXPECT_EQ(analyzer.DetectWorkloadType(second), WorkloadType::kMixed);
     const auto stats = analyzer.FeatureStats();
     EXPECT_EQ(stats.samples, 2);
