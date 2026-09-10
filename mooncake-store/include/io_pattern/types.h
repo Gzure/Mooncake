@@ -204,6 +204,11 @@ struct PolicyContext {
     IoPatternSnapshot snapshot;
     PatternResult analysis;
     std::string session_id;
+    // Cold-data eviction gate: when non-zero, only objects idle at least this
+    // long are eligible. Applied here rather than by pre-summing idle bytes into
+    // the byte target, so the budget and the selected victims describe the same
+    // keys. 0 disables the gate.
+    uint64_t min_idle_time_us{0};
 };
 
 struct TraceEvent {

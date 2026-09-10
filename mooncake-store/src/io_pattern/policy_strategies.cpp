@@ -65,12 +65,20 @@ EvictionPlan ScoreBasedEvictionOps::Evaluate(const PolicyContext& context,
         if ((key.replica_tiers & CacheTierBit(tier)) == 0 || key.pinned) {
             continue;
         }
+        if (context.min_idle_time_us != 0 &&
+            key.idle_time_us < context.min_idle_time_us) {
+            continue;
+        }
         max_block_size = std::max(max_block_size, key.block_size);
         max_other_replicas = std::max(max_other_replicas,
                                       key.other_replica_count);
     }
     for (const auto& key : context.snapshot.keys) {
         if ((key.replica_tiers & CacheTierBit(tier)) == 0 || key.pinned) {
+            continue;
+        }
+        if (context.min_idle_time_us != 0 &&
+            key.idle_time_us < context.min_idle_time_us) {
             continue;
         }
         const auto* pattern = FindPattern(key.object, context.analysis);

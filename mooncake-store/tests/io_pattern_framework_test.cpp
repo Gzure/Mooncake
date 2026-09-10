@@ -1906,5 +1906,35 @@ TEST(IoPatternFrameworkTest, LocalDiskCountsAsALowerTierThanHostMemory) {
     EXPECT_FLOAT_EQ(plan.candidates.front().score, 2.0F);
 }
 
+TEST(IoPatternFrameworkTest, ScoreEvictionHonoursTheColdIdleGate) {
+    // The cold-eviction driver gates victims by idle time. Applying that gate
+    // where candidates are selected -- rather than pre-summing idle bytes into
+    // the byte target -- keeps the budget and the victim set describing the same
+    // keys, so a pass cannot reclaim objects the driver never considered cold.
+    PolicyContext context;
+    context.min_idle_time_us = 1'000'000;  // 1 s
+    KeyMetrics fresh;
+    fresh.object = {TenantId("tenant-a"), "fresh"};
+    fresh.idle_time_us = 500'000;  // below the gate
+    fresh.block_size = 64;
+    fresh.replica_tiers = CacheTierBit(CacheTier::kL1Host);
+    KeyMetrics cold;
+    cold.object = {TenantId("tenant-a"), "cold"};
+    cold.idle_time_us = 5'000'000;  // above the gate
+    cold.block_size = 64;
+    cold.replica_tiers = CacheTierBit(CacheTier::kL1Host);
+    context.snapshot.keys = {fresh, cold};
+    context.analysis.keys = {
+        KeyPattern{.object = fresh.object, .idle_score = 1.0F},
+        KeyPattern{.object = cold.object, .idle_score = 0.1F}};
+
+    ScoreBasedEvictionOps eviction;
+    const auto plan = eviction.Evaluate(context, CacheTier::kL1Host, 64);
+
+    ASSERT_EQ(plan.candidates.size(), 1U);
+    // Only the genuinely idle key is eligible, even though "fresh" scores higher.
+    EXPECT_EQ(plan.candidates.front().object.key, "cold");
+}
+
 }  // namespace
 }  // namespace mooncake::io_pattern

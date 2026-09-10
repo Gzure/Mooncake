@@ -257,7 +257,8 @@ PolicyResult IoPatternRuntime::Plan(
 
 IoPatternRuntime::PlannedPolicy IoPatternRuntime::BuildPolicy(
     CacheTier eviction_tier, uint64_t eviction_bytes, const TraceHistory& trace,
-    const std::vector<ObjectRef>& admissions, const std::string& session_id) {
+    const std::vector<ObjectRef>& admissions, const std::string& session_id,
+    uint64_t min_idle_time_us) {
     PlannedPolicy planned;
     planned.snapshot = collector_->GetSnapshot();
     const auto start = std::chrono::steady_clock::now();
@@ -273,8 +274,10 @@ IoPatternRuntime::PlannedPolicy IoPatternRuntime::BuildPolicy(
     workload_policy_->SetSessionWorkloads(analysis.sessions);
     workload_policy_->AdvanceTransitionWindow();
     planned.result = policy_->ExecutePolicy(
-        PolicyContext{.snapshot = planned.snapshot, .analysis = analysis,
-                      .session_id = session_id},
+        PolicyContext{.snapshot = planned.snapshot,
+                      .analysis = analysis,
+                      .session_id = session_id,
+                      .min_idle_time_us = min_idle_time_us},
         eviction_tier, eviction_bytes, CacheTier::kL1Host, trace, admissions);
     planned.result.degraded =
         planned.result.degraded || collector_->degraded() ||
@@ -412,30 +415,6 @@ void IoPatternRuntime::DeriveEvictionRequest(const IoPatternSnapshot& snapshot,
                          : (capacity_bytes > 0 ? capacity_bytes / 10 : 0);
 }
 
-uint64_t IoPatternRuntime::ColdEvictionBudget(
-    const IoPatternSnapshot& snapshot, uint64_t idle_threshold_us,
-    uint64_t max_bytes) {
-    if (max_bytes == 0) return 0;
-    uint64_t budget = 0;
-    for (const auto& key : snapshot.keys) {
-        if ((key.replica_tiers & CacheTierBit(CacheTier::kL1Host)) == 0 ||
-            key.pinned) {
-            continue;
-        }
-        if (idle_threshold_us != 0 &&
-            key.idle_time_us < idle_threshold_us) {
-            continue;
-        }
-        // Skip keys with no capacity estimate (block_size unset/unknown).
-        if (key.block_size == 0) continue;
-        budget = budget > std::numeric_limits<uint64_t>::max() - key.block_size
-                     ? std::numeric_limits<uint64_t>::max()
-                     : budget + key.block_size;
-        if (budget >= max_bytes) return max_bytes;
-    }
-    return budget;
-}
-
 TraceHistory IoPatternRuntime::DeriveTraceHistory(
     const IoPatternSnapshot& snapshot) {
     // Report-driven prefetch input: keys that were recently served as hits and
@@ -510,15 +489,15 @@ void IoPatternRuntime::RunReportDrivenCycle() {
     // driven by cold/hot analysis and not only by memory pressure. Candidate
     // selection still goes through the policy engine (ScoreBasedEvictionOps
     // ranks the coldest first); this driver only supplies a byte target.
+    uint64_t cold_idle_threshold_us = 0;
     if (eviction_bytes == 0 && config_.report_driven_cold_eviction &&
         config_.report_driven_cold_eviction_bytes != 0) {
-        const uint64_t cold_bytes = ColdEvictionBudget(
-            snapshot, config_.report_driven_cold_idle_threshold_us,
-            config_.report_driven_cold_eviction_bytes);
-        if (cold_bytes != 0) {
-            eviction_bytes = cold_bytes;
-            report.cold_eviction = true;
-        }
+        // The idle gate is applied where the policy selects victims, so the byte
+        // budget and the victim set describe the same keys. Pre-summing the idle
+        // keys' bytes here produced a target the selector was free to ignore.
+        eviction_bytes = config_.report_driven_cold_eviction_bytes;
+        cold_idle_threshold_us = config_.report_driven_cold_idle_threshold_us;
+        report.cold_eviction = true;
     }
     report.eviction_tier = eviction_tier;
     report.eviction_target_bytes = eviction_bytes;
@@ -527,7 +506,8 @@ void IoPatternRuntime::RunReportDrivenCycle() {
     report.admission_candidates = admissions.size();
 
     auto planned = BuildPolicy(eviction_tier, eviction_bytes, trace,
-                               admissions, "report-driven");
+                               admissions, "report-driven",
+                               cold_idle_threshold_us);
     report.analysis_elapsed_us = planned.analysis_elapsed_us;
     const auto& result = planned.result;
     report.eviction_candidates = result.eviction.candidates.size();

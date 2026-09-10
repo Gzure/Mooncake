@@ -186,7 +186,8 @@ class IoPatternRuntime final {
                               uint64_t eviction_bytes,
                               const TraceHistory& trace,
                               const std::vector<ObjectRef>& admissions,
-                              const std::string& session_id);
+                              const std::string& session_id,
+                              uint64_t min_idle_time_us = 0);
     void AdmissionWorker();
     ErrorCode ExecuteAdmission(const ObjectRef& object, CacheTier target_tier,
                                const std::string& session_id);
@@ -203,13 +204,6 @@ class IoPatternRuntime final {
                                       float high_ratio, float target_ratio,
                                       CacheTier& eviction_tier,
                                       uint64_t& eviction_bytes);
-    // Cold-data eviction driver input: scans the merged snapshot for L1 keys
-    // that are not pinned and idle at least `idle_threshold_us` (0 = any idle
-    // gate disabled) and returns the total byte budget bounded by `max_bytes`.
-    // Returns 0 when there is no idle L1 key to reclaim.
-    static uint64_t ColdEvictionBudget(const IoPatternSnapshot& snapshot,
-                                       uint64_t idle_threshold_us,
-                                       uint64_t max_bytes);
     static TraceHistory DeriveTraceHistory(const IoPatternSnapshot& snapshot);
     static std::vector<ObjectRef> DeriveAdmissionCandidates(
         const IoPatternSnapshot& snapshot);
