@@ -452,6 +452,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
         static_cast<float>(eviction_high_watermark_ratio_);
     io_pattern_config.report_eviction_target_ratio = static_cast<float>(
         std::max(0.0, eviction_high_watermark_ratio_ - eviction_ratio_));
+    // Admission must stop before eviction starts. Deriving the admission
+    // watermark from the same high watermark removes the window in which the
+    // store evicts while still admitting new objects.
+    io_pattern_config.admission_watermark_ratio =
+        static_cast<float>(eviction_high_watermark_ratio_);
     // Cold-data eviction driver: allow merged reports to reclaim the coldest
     // real objects even below the memory watermark (opt-in via master flags).
     io_pattern_config.report_driven_cold_eviction =

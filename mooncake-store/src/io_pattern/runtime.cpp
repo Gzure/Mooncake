@@ -42,7 +42,8 @@ IoPatternRuntime::IoPatternRuntime(Handlers handlers, Config config)
     auto sliding = std::make_shared<SlidingWindowAnalyzer>(
         config.analysis_window_ns);
     analyzer_ = std::make_shared<ResilientAnalyzer>(std::move(sliding));
-    workload_policy_ = std::make_shared<WorkloadPolicyEngine>();
+    workload_policy_ = std::make_shared<WorkloadPolicyEngine>(
+        WorkloadType::kMixed, 3, config_.admission_watermark_ratio);
     std::shared_ptr<mooncake::EvictionStrategy> legacy_strategy;
     if (config_.legacy_fallback == LegacyFallback::kFifo) {
         legacy_strategy = std::make_shared<FIFOEvictionStrategy>();

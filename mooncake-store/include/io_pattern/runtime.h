@@ -96,6 +96,10 @@ class IoPatternRuntime final {
         // snapshot is considered under pressure and an eviction cycle is
         // executed. Mirrors the master's own high-watermark trigger.
         float report_eviction_high_ratio{0.80F};
+        // Storage ratio at or above which admission into the head tier is
+        // refused. MasterService derives it from the same eviction high
+        // watermark so admission stops before eviction starts.
+        float admission_watermark_ratio{0.90F};
         // After an eviction cycle the tier is considered relieved once this
         // ratio is reached; eviction target bytes are derived as
         // (peak_ratio - report_eviction_target_ratio) * capacity_bytes.

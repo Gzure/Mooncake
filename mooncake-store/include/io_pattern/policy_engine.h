@@ -159,9 +159,11 @@ class RegistryPolicyEngine final : public PolicyEngine {
 class WorkloadPolicyEngine final : public PolicyEngine {
    public:
     explicit WorkloadPolicyEngine(WorkloadType type = WorkloadType::kMixed,
-                                  uint32_t transition_windows = 3)
+                                  uint32_t transition_windows = 3,
+                                  float admission_watermark_ratio = 0.90F)
         : transition_windows_(transition_windows), workload_type_(type),
-          previous_type_(type) {
+          previous_type_(type),
+          admission_watermark_ratio_(admission_watermark_ratio) {
         Configure(type);
     }
 
@@ -327,6 +329,11 @@ class WorkloadPolicyEngine final : public PolicyEngine {
                 break;
         }
         if (tuned_eviction_ && !eviction_override) eviction = *tuned_eviction_;
+        // Derived from the store's eviction high watermark rather than a fixed
+        // 0.90: admission must stop before eviction starts, otherwise the window
+        // between the two watermarks keeps admitting objects the store is
+        // already reclaiming.
+        admission.max_memory_used_ratio = admission_watermark_ratio_;
         return std::make_shared<ComposedPolicyEngine>(
             std::make_shared<ScoreBasedEvictionOps>(eviction),
             std::make_shared<TraceBasedPrefetchOps>(prefetch),
@@ -354,6 +361,7 @@ class WorkloadPolicyEngine final : public PolicyEngine {
     std::optional<ScoreBasedEvictionConfig> tuned_eviction_;
     ScoreBasedEvictionConfig active_eviction_;
     ScoreBasedEvictionConfig previous_eviction_;
+    float admission_watermark_ratio_{0.90F};
 };
 
 }  // namespace mooncake::io_pattern

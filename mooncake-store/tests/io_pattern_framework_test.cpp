@@ -1943,5 +1943,25 @@ TEST(IoPatternFrameworkTest, ScoreEvictionHonoursTheColdIdleGate) {
     EXPECT_EQ(plan.candidates.front().object.key, "cold");
 }
 
+TEST(IoPatternFrameworkTest, AdmissionWatermarkFollowsTheConfiguredHighWatermark) {
+    // Admission must stop before eviction starts, so the watermark is derived
+    // from the store's eviction high watermark instead of a fixed 0.90: a store
+    // configured to evict at 0.75 also refuses admission at 0.75 rather than
+    // continuing to admit through the 0.75..0.90 window.
+    WorkloadPolicyEngine engine(WorkloadType::kMixed, 3, 0.75F);
+    PolicyContext context;
+    KeyMetrics key;
+    key.object = {TenantId("tenant-a"), "hot"};
+    key.access_count_window = 32;
+    context.snapshot.keys.push_back(key);
+    context.snapshot.storage = {StorageMetric{.source_id = "host",
+                                              .tier = CacheTier::kL1Host,
+                                              .memory_used_ratio = 0.80F}};
+
+    EXPECT_EQ(engine.DecideAdmission(key.object, CacheTier::kL1Host, context)
+                  .decision,
+              AdmissionDecision::kRejectWatermark);
+}
+
 }  // namespace
 }  // namespace mooncake::io_pattern
