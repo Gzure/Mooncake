@@ -55,6 +55,11 @@ class IoPatternRuntime final {
         // (analysis-selected idle keys) rather than a storage-pressure
         // watermark request.
         bool cold_eviction{false};
+        // True when the eviction dimension was a demotion pass instead: the
+        // candidates were copied down to LOCAL_DISK and kept their MEMORY
+        // replica, so eviction_target_bytes is a demotion budget and
+        // eviction_status is the demotion outcome. Nothing was reclaimed.
+        bool tier_down{false};
         // Prefetch dimension (derived from merged prefix-affinity keys).
         size_t prefetch_candidates{0};
         ErrorCode prefetch_status{ErrorCode::OK};
@@ -122,6 +127,16 @@ class IoPatternRuntime final {
         // Max bytes a single cold-eviction pass may request (per drained
         // cycle). 0 disables the cold driver regardless of the enable flag.
         uint64_t report_driven_cold_eviction_bytes{0};
+        // Policy-driven tier down: the below-watermark placement action. When a
+        // report-driven cycle finds no reclaim request (neither storage pressure
+        // nor the cold-eviction driver) it spends this budget copying the coldest
+        // in-memory keys down to LOCAL_DISK while keeping their MEMORY replica,
+        // so a later reclaim of those keys can discard them safely instead of
+        // paying for the copy then. A demotion frees nothing, so a reclaim always
+        // wins the cycle, and the cycle report marks `tier_down=true` so a
+        // demotion is never counted as an eviction. There is no separate enable
+        // flag: 0 keeps the driver off, so this budget is the whole control.
+        uint64_t tier_down_bytes_per_cycle{0};
         // Optional per-cycle observer used to surface executions in process
         // metrics (e.g. MasterMetricManager). Never called from the report
         // data path; only from the background cycle worker.
@@ -195,7 +210,8 @@ class IoPatternRuntime final {
                               const TraceHistory& trace,
                               const std::vector<ObjectRef>& admissions,
                               const std::string& session_id,
-                              uint64_t min_idle_time_us = 0);
+                              uint64_t min_idle_time_us = 0,
+                              bool tier_down = false);
     void AdmissionWorker();
     ErrorCode ExecuteAdmission(const ObjectRef& object, CacheTier target_tier,
                                const std::string& session_id);

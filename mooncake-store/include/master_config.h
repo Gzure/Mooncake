@@ -169,10 +169,12 @@ struct MasterConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
-    // Policy-driven tier down: copy a selected object down to local disk while
-    // keeping its MEMORY replica (tier down is a copy, not a reclaim), bounded by
-    // a per-cycle byte budget. A zero budget disables the driver.
-    bool io_pattern_tier_down = false;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
     uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
     // Admission gates. The frequency threshold defaults to 2, matching the
     // master's own second-touch promotion gate; 1 restores the previous
@@ -302,10 +304,12 @@ class MasterServiceSupervisorConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
-    // Policy-driven tier down: copy a selected object down to local disk while
-    // keeping its MEMORY replica (tier down is a copy, not a reclaim), bounded by
-    // a per-cycle byte budget. A zero budget disables the driver.
-    bool io_pattern_tier_down = false;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
     uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
     // Admission gates. The frequency threshold defaults to 2, matching the
     // master's own second-touch promotion gate; 1 restores the previous
@@ -379,7 +383,6 @@ class MasterServiceSupervisorConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
-        io_pattern_tier_down = config.io_pattern_tier_down;
         io_pattern_tier_down_bytes_per_cycle =
             config.io_pattern_tier_down_bytes_per_cycle;
         io_pattern_admission_frequency_threshold =
@@ -592,10 +595,12 @@ class WrappedMasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
-    // Policy-driven tier down: copy a selected object down to local disk while
-    // keeping its MEMORY replica (tier down is a copy, not a reclaim), bounded by
-    // a per-cycle byte budget. A zero budget disables the driver.
-    bool io_pattern_tier_down = false;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
     uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
     // Admission gates. The frequency threshold defaults to 2, matching the
     // master's own second-touch promotion gate; 1 restores the previous
@@ -713,7 +718,6 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
-        io_pattern_tier_down = config.io_pattern_tier_down;
         io_pattern_tier_down_bytes_per_cycle =
             config.io_pattern_tier_down_bytes_per_cycle;
         io_pattern_admission_frequency_threshold =
@@ -849,7 +853,6 @@ class WrappedMasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
-        io_pattern_tier_down = config.io_pattern_tier_down;
         io_pattern_tier_down_bytes_per_cycle =
             config.io_pattern_tier_down_bytes_per_cycle;
         io_pattern_admission_frequency_threshold =
@@ -1331,10 +1334,12 @@ class MasterServiceConfig {
     bool promotion_on_hit = false;
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
-    // Policy-driven tier down: copy a selected object down to local disk while
-    // keeping its MEMORY replica (tier down is a copy, not a reclaim), bounded by
-    // a per-cycle byte budget. A zero budget disables the driver.
-    bool io_pattern_tier_down = false;
+    // Policy-driven tier down: below the memory watermark, copy the coldest
+    // objects down to local disk while keeping their MEMORY replica (tier down is
+    // a copy, not a reclaim), so a later reclaim can discard them safely. There
+    // is no separate enable switch: a non-zero per-cycle budget is the control,
+    // and 0 keeps the driver off. A reclaim always wins, so a cycle that reaches
+    // the watermark evicts instead of demoting.
     uint64_t io_pattern_tier_down_bytes_per_cycle = 0;
     // Admission gates. The frequency threshold defaults to 2, matching the
     // master's own second-touch promotion gate; 1 restores the previous
@@ -1449,7 +1454,6 @@ class MasterServiceConfig {
         promotion_on_hit = config.promotion_on_hit;
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
-        io_pattern_tier_down = config.io_pattern_tier_down;
         io_pattern_tier_down_bytes_per_cycle =
             config.io_pattern_tier_down_bytes_per_cycle;
         io_pattern_admission_frequency_threshold =

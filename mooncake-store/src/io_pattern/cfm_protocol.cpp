@@ -252,6 +252,14 @@ std::string CfmBinaryCodec::EncodePolicy(const PolicyCommand& command) const {
             Append(output, candidate.score);
             AppendEnum(output, candidate.target_tier);
         }
+        // Tier-down trailer, appended after the original layout so a decoder
+        // that predates it still finds the candidate list it expects. Without
+        // this a plan sent to a remote SubMaster would arrive as pure eviction
+        // and the executor would reclaim the keys the driver meant to keep.
+        Append(output, eviction->tier_down_target_bytes);
+        for (const auto& candidate : eviction->candidates) {
+            AppendEnum(output, candidate.action);
+        }
     } else if (const auto* prefetch = std::get_if<PrefetchPlan>(&command)) {
         AppendHeader(output, 'P');
         AppendPrefetchPlan(output, *prefetch);
@@ -295,6 +303,24 @@ std::optional<PolicyCommand> CfmBinaryCodec::DecodePolicy(
                 return std::nullopt;
             }
             plan.candidates.push_back(std::move(candidate));
+        }
+        // Optional tier-down trailer. A payload encoded before tier down existed
+        // ends here, and both fields keep their defaults (kEvict / 0), which is
+        // exactly the pre-tier-down meaning of the plan. A partly written trailer
+        // is a decode error rather than a silent default.
+        if (offset < payload.size()) {
+            if (!Read(payload, offset, plan.tier_down_target_bytes)) {
+                return std::nullopt;
+            }
+            for (auto& candidate : plan.candidates) {
+                uint8_t raw_action = 0;
+                if (!Read(payload, offset, raw_action) ||
+                    raw_action >
+                        static_cast<uint8_t>(EvictionAction::kTierDown)) {
+                    return std::nullopt;
+                }
+                candidate.action = static_cast<EvictionAction>(raw_action);
+            }
         }
         return offset == payload.size()
                    ? std::optional<PolicyCommand>(std::move(plan))

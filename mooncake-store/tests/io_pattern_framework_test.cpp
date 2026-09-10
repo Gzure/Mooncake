@@ -920,6 +920,55 @@ TEST(IoPatternFrameworkTest, BinaryCfmCodecRoundTripsAllPolicyCommands) {
     EXPECT_TRUE(decoded_batch->accesses.front().is_hit);
 }
 
+// An EvictionPlan crosses the CFM wire to a remote SubMaster, so the
+// per-candidate action and the tier-down budget have to survive the codec:
+// otherwise the remote executor receives a plan that looks like pure eviction
+// and reclaims the very keys the driver chose to demote.
+TEST(IoPatternFrameworkTest, BinaryCfmCodecCarriesTierDownActionAndBudget) {
+    CfmBinaryCodec codec;
+    EvictionPlan plan{.source_tier = CacheTier::kL1Host,
+                      .target_bytes = 4096,
+                      .candidates = {EvictionCandidate{
+                                         .object = {TenantId("tenant"), "demote"},
+                                         .bytes = 4096,
+                                         .score = 0.5F,
+                                         .target_tier = CacheTier::kLocalDisk,
+                                         .action = EvictionAction::kTierDown},
+                                     EvictionCandidate{
+                                         .object = {TenantId("tenant"), "reclaim"},
+                                         .bytes = 4096,
+                                         .score = 0.25F,
+                                         .target_tier = CacheTier::kL3NofSsd,
+                                         .action = EvictionAction::kEvict}},
+                      .tier_down_target_bytes = 4096};
+
+    const auto payload = codec.EncodePolicy(plan);
+    const auto decoded = codec.DecodePolicy(payload);
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_TRUE(std::holds_alternative<EvictionPlan>(*decoded));
+    const auto& out = std::get<EvictionPlan>(*decoded);
+    ASSERT_EQ(out.candidates.size(), 2);
+    EXPECT_EQ(out.candidates[0].action, EvictionAction::kTierDown);
+    EXPECT_EQ(out.candidates[1].action, EvictionAction::kEvict);
+    EXPECT_EQ(out.tier_down_target_bytes, 4096u);
+    EXPECT_EQ(out.target_bytes, 4096u);
+
+    // A payload written before tier down existed stops after the candidate list
+    // and still decodes. Both new fields then keep their pre-tier-down meaning
+    // (kEvict / 0) instead of silently turning the plan into a demotion.
+    const size_t trailer_bytes = sizeof(uint64_t) + out.candidates.size();
+    ASSERT_GT(payload.size(), trailer_bytes);
+    const auto legacy =
+        codec.DecodePolicy(payload.substr(0, payload.size() - trailer_bytes));
+    ASSERT_TRUE(legacy.has_value());
+    ASSERT_TRUE(std::holds_alternative<EvictionPlan>(*legacy));
+    const auto& old = std::get<EvictionPlan>(*legacy);
+    ASSERT_EQ(old.candidates.size(), 2);
+    EXPECT_EQ(old.candidates[0].action, EvictionAction::kEvict);
+    EXPECT_EQ(old.candidates[1].action, EvictionAction::kEvict);
+    EXPECT_EQ(old.tier_down_target_bytes, 0u);
+}
+
 TEST(IoPatternFrameworkTest, InProcessCfmTransportDispatchesReports) {
     CfmBinaryCodec codec;
     bool received_snapshot = false;
@@ -1328,6 +1377,212 @@ TEST(IoPatternFrameworkTest, ReportDrivenColdEvictionRunsWithoutPressure) {
     EXPECT_EQ(last_report->eviction_status, ErrorCode::OK);
 }
 
+TEST(IoPatternFrameworkTest, ReportDrivenTierDownLabelsCandidatesWithoutPressure) {
+    // The tier-down driver must make the policy label its candidates as
+    // demotions: the plan it produces copies the selected keys down to
+    // LOCAL_DISK and keeps their MEMORY replica, so nothing is reclaimed. It
+    // fires from a report with no storage pressure at all.
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    std::optional<IoPatternRuntime::ReportDrivenCycleReport> last_report;
+    std::mutex plan_mutex;
+    std::optional<EvictionPlan> handled_plan;
+    IoPatternRuntime::Config config;
+    config.report_driven_execution = true;
+    // The budget alone enables the driver: there is no enable flag.
+    config.tier_down_bytes_per_cycle = 96ULL * 1024 * 1024;
+    // Let the detached analyzer finish so candidate selection is deterministic.
+    config.analysis_timeout_us = 30'000'000;
+    config.report_driven_observer =
+        [&](const IoPatternRuntime::ReportDrivenCycleReport& report) {
+            std::lock_guard lock(observer_mutex);
+            last_report = report;
+            observer_condition.notify_all();
+        };
+    auto rt = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction =
+                [&](const EvictionPlan& plan) {
+                    std::lock_guard lock(plan_mutex);
+                    handled_plan = plan;
+                    return ErrorCode::OK;
+                },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        std::move(config));
+    CfmService service(rt);
+    CfmBinaryCodec codec;
+    MetricBatch batch;
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "demote-key"},
+                     .observed_at_ns = 1,
+                     .block_size = 4096,
+                     .tier = CacheTier::kL1Host,
+                     .operation = IoOperation::kGet,
+                     .is_hit = true});
+    // No storage metric, no cold-eviction driver: only tier down can act.
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(batch)));
+
+    std::unique_lock lock(observer_mutex);
+    ASSERT_TRUE(observer_condition.wait_for(lock, std::chrono::seconds(30), [&] {
+        return last_report.has_value();
+    }));
+    ASSERT_TRUE(last_report.has_value());
+    EXPECT_TRUE(last_report->tier_down);
+    EXPECT_FALSE(last_report->cold_eviction);
+    EXPECT_EQ(last_report->eviction_target_bytes, 96ULL * 1024 * 1024);
+    EXPECT_GT(last_report->eviction_candidates, 0u);
+    EXPECT_EQ(last_report->eviction_status, ErrorCode::OK);
+
+    std::lock_guard plan_lock(plan_mutex);
+    ASSERT_TRUE(handled_plan.has_value());
+    // The budget is carried as a demotion budget, and every candidate is
+    // labelled a demotion -- the action comes from the driver, not target_tier.
+    EXPECT_EQ(handled_plan->tier_down_target_bytes, 96ULL * 1024 * 1024);
+    ASSERT_FALSE(handled_plan->candidates.empty());
+    for (const auto& candidate : handled_plan->candidates) {
+        EXPECT_EQ(candidate.action, EvictionAction::kTierDown);
+    }
+}
+
+TEST(IoPatternFrameworkTest, ReportDrivenTierDownYieldsToPressureEviction) {
+    // A demotion frees nothing, so a reclaim always wins the cycle: with the
+    // tier-down driver enabled and host memory above the high watermark, the
+    // same configuration must produce an eviction plan instead of a demotion.
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    std::optional<IoPatternRuntime::ReportDrivenCycleReport> last_report;
+    std::mutex plan_mutex;
+    std::optional<EvictionPlan> handled_plan;
+    IoPatternRuntime::Config config;
+    config.report_driven_execution = true;
+    // Same budget-only enablement, with host memory above the high watermark.
+    config.tier_down_bytes_per_cycle = 96ULL * 1024 * 1024;
+    config.analysis_timeout_us = 30'000'000;
+    config.report_driven_observer =
+        [&](const IoPatternRuntime::ReportDrivenCycleReport& report) {
+            std::lock_guard lock(observer_mutex);
+            last_report = report;
+            observer_condition.notify_all();
+        };
+    auto rt = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction =
+                [&](const EvictionPlan& plan) {
+                    std::lock_guard lock(plan_mutex);
+                    handled_plan = plan;
+                    return ErrorCode::OK;
+                },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        std::move(config));
+    CfmService service(rt);
+    CfmBinaryCodec codec;
+    MetricBatch batch;
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "hot-key"},
+                     .observed_at_ns = 1,
+                     .block_size = 4096,
+                     .tier = CacheTier::kL1Host,
+                     .operation = IoOperation::kGet,
+                     .is_hit = true});
+    batch.storage.push_back(
+        StorageMetric{.source_id = "reporter",
+                      .observed_at_ns = 1,
+                      .tier = CacheTier::kL1Host,
+                      .used_bytes = 1024ULL * 1024 * 1024,
+                      .capacity_bytes = 1024ULL * 1024 * 1024,
+                      .memory_used_ratio = 0.95F});
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(batch)));
+
+    std::unique_lock lock(observer_mutex);
+    ASSERT_TRUE(observer_condition.wait_for(lock, std::chrono::seconds(30), [&] {
+        return last_report.has_value();
+    }));
+    ASSERT_TRUE(last_report.has_value());
+    EXPECT_FALSE(last_report->tier_down);
+    EXPECT_FALSE(last_report->cold_eviction);
+    EXPECT_GT(last_report->eviction_target_bytes, 0);
+    EXPECT_EQ(last_report->eviction_status, ErrorCode::OK);
+
+    std::lock_guard plan_lock(plan_mutex);
+    ASSERT_TRUE(handled_plan.has_value());
+    EXPECT_EQ(handled_plan->tier_down_target_bytes, 0u);
+    ASSERT_FALSE(handled_plan->candidates.empty());
+    for (const auto& candidate : handled_plan->candidates) {
+        EXPECT_EQ(candidate.action, EvictionAction::kEvict);
+    }
+}
+
+TEST(IoPatternFrameworkTest, ReportDrivenTierDownPavesColdDataBeforeColdEviction) {
+    // Both drivers act below the watermark, but only one can own the cycle. The
+    // tier-down budget takes it: demoting a key that the same cycle would have
+    // discarded defeats the point of paving cold data down first, so the
+    // cold-eviction driver only keeps the slot when no tier-down budget is
+    // configured (see ReportDrivenColdEvictionRunsWithoutPressure).
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    std::optional<IoPatternRuntime::ReportDrivenCycleReport> last_report;
+    std::mutex plan_mutex;
+    std::optional<EvictionPlan> handled_plan;
+    IoPatternRuntime::Config config;
+    config.report_driven_execution = true;
+    config.tier_down_bytes_per_cycle = 96ULL * 1024 * 1024;
+    config.report_driven_cold_eviction = true;
+    config.report_driven_cold_eviction_bytes = 128ULL * 1024 * 1024;
+    config.report_driven_cold_idle_threshold_us = 0;
+    config.analysis_timeout_us = 30'000'000;
+    config.report_driven_observer =
+        [&](const IoPatternRuntime::ReportDrivenCycleReport& report) {
+            std::lock_guard lock(observer_mutex);
+            last_report = report;
+            observer_condition.notify_all();
+        };
+    auto rt = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction =
+                [&](const EvictionPlan& plan) {
+                    std::lock_guard lock(plan_mutex);
+                    handled_plan = plan;
+                    return ErrorCode::OK;
+                },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        std::move(config));
+    CfmService service(rt);
+    CfmBinaryCodec codec;
+    MetricBatch batch;
+    batch.accesses.push_back(
+        AccessRecord{.object = {TenantId("tenant"), "cold-key"},
+                     .observed_at_ns = 1,
+                     .block_size = 4096,
+                     .tier = CacheTier::kL1Host,
+                     .operation = IoOperation::kGet,
+                     .is_hit = true});
+    ASSERT_TRUE(service.Send("report_metric_batch",
+                             codec.EncodeMetricBatch(batch)));
+
+    std::unique_lock lock(observer_mutex);
+    ASSERT_TRUE(observer_condition.wait_for(lock, std::chrono::seconds(30), [&] {
+        return last_report.has_value();
+    }));
+    ASSERT_TRUE(last_report.has_value());
+    EXPECT_TRUE(last_report->tier_down);
+    EXPECT_FALSE(last_report->cold_eviction);
+    // The tier-down budget, not the cold-eviction budget, sized this cycle.
+    EXPECT_EQ(last_report->eviction_target_bytes, 96ULL * 1024 * 1024);
+
+    std::lock_guard plan_lock(plan_mutex);
+    ASSERT_TRUE(handled_plan.has_value());
+    EXPECT_EQ(handled_plan->tier_down_target_bytes, 96ULL * 1024 * 1024);
+    ASSERT_FALSE(handled_plan->candidates.empty());
+    for (const auto& candidate : handled_plan->candidates) {
+        EXPECT_EQ(candidate.action, EvictionAction::kTierDown);
+    }
+}
+
 TEST(IoPatternFrameworkTest, ReporterBackgroundLifecycleFlushesOnStop) {
     size_t batches = 0;
     IoPatternReporter reporter(4, [&](const MetricBatch&) {
@@ -1615,6 +1870,38 @@ TEST(IoPatternFrameworkTest, TierDownTemplatesChooseDocumentedTargets) {
     EXPECT_EQ(recommendation.Evaluate(context, CacheTier::kL0Hbm, 64)
                   .candidates.front().target_tier,
               CacheTier::kL1Host);
+}
+
+// The candidate action is decided by the driver (PolicyContext::tier_down) and
+// must never be derived from target_tier: TierDownTarget() returns source+1 for
+// L0/L1/L2 alike, so a derived action would label every candidate a demotion and
+// eviction would stop working entirely.
+TEST(IoPatternFrameworkTest, TierDownContextLabelsCandidatesAndBudget) {
+    PolicyContext context;
+    context.snapshot.keys = {KeyMetrics{
+        .object = {TenantId("tenant"), "key"},
+        .block_size = 64,
+        .replica_tiers = CacheTierBit(CacheTier::kL1Host)}};
+    context.analysis.keys = {
+        KeyPattern{.object = context.snapshot.keys.front().object}};
+
+    ScoreBasedEvictionOps ops;
+
+    const auto reclaimed = ops.Evaluate(context, CacheTier::kL1Host, 64);
+    ASSERT_EQ(reclaimed.candidates.size(), 1);
+    EXPECT_EQ(reclaimed.candidates.front().object.key, "key");
+    EXPECT_EQ(reclaimed.candidates.front().action, EvictionAction::kEvict);
+    EXPECT_EQ(reclaimed.tier_down_target_bytes, 0u);
+
+    context.tier_down = true;
+    const auto demoted = ops.Evaluate(context, CacheTier::kL1Host, 64);
+    ASSERT_EQ(demoted.candidates.size(), 1);
+    EXPECT_EQ(demoted.candidates.front().object.key, "key");
+    EXPECT_EQ(demoted.candidates.front().action, EvictionAction::kTierDown);
+    EXPECT_EQ(demoted.tier_down_target_bytes, 64u);
+    // Same victims either way: only the action differs.
+    EXPECT_EQ(demoted.candidates.front().target_tier,
+              reclaimed.candidates.front().target_tier);
 }
 
 TEST(IoPatternFrameworkTest, PrefetchRequiresConfidenceAndNeverPromotesToHbm) {

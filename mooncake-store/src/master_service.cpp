@@ -478,6 +478,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << " bytes, idle threshold="
                   << config.io_pattern_cold_idle_threshold_us << " us";
     }
+    // Policy-driven tier-down driver: below the memory watermark, copy the
+    // coldest in-memory keys down to LOCAL_DISK while keeping their MEMORY
+    // replica, so a later reclaim can discard them safely. The per-cycle budget
+    // is the whole control: 0 (the default) keeps the driver off.
+    io_pattern_config.tier_down_bytes_per_cycle =
+        config.io_pattern_tier_down_bytes_per_cycle;
+    if (config.io_pattern_tier_down_bytes_per_cycle != 0) {
+        LOG(INFO) << "Policy-driven tier down enabled: per-cycle budget="
+                  << config.io_pattern_tier_down_bytes_per_cycle << " bytes";
+    }
     io_pattern_config.report_driven_observer =
         [](const io_pattern::IoPatternRuntime::ReportDrivenCycleReport& rpt) {
             auto& metrics = MasterMetricManager::instance();
@@ -489,7 +499,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
             // clean no-op, not a failure); prefetch/admission likewise only
             // reach their handler when candidates were planned. Failures are
             // counted when the storage handler rejected the plan.
-            if (rpt.eviction_candidates != 0) {
+            //
+            // A tier-down cycle is excluded from the eviction counters: it copies
+            // keys down and frees nothing, so counting it as a report-driven
+            // eviction would overstate reclaim. Its outcome is visible through
+            // MasterService's own tier_down_attempt/success/failure counters.
+            if (rpt.tier_down) {
+                LOG(INFO) << "[IO-PATTERN-TIER-DOWN] report-driven tier-down "
+                             "cycle="
+                          << rpt.cycle_id
+                          << " budget=" << rpt.eviction_target_bytes
+                          << " candidates=" << rpt.eviction_candidates
+                          << " status=" << static_cast<int>(rpt.eviction_status)
+                          << " skipped=" << rpt.skipped_dimensions;
+            } else if (rpt.eviction_candidates != 0) {
                 metrics.inc_io_pattern_report_evictions();
                 if (rpt.eviction_status != ErrorCode::OK) {
                     metrics.inc_io_pattern_report_eviction_failures();
@@ -517,7 +540,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << ", bytes=" << rpt.eviction_target_bytes
                       << ", candidates=" << rpt.eviction_candidates
                       << ", status=" << static_cast<int>(rpt.eviction_status)
-                      << ", cold=" << rpt.cold_eviction << ")"
+                      << ", cold=" << rpt.cold_eviction
+                      << ", tier_down=" << rpt.tier_down << ")"
                       << " prefetch(candidates=" << rpt.prefetch_candidates
                       << ", status=" << static_cast<int>(rpt.prefetch_status)
                       << ")"
@@ -563,13 +587,58 @@ MasterService::MasterService(const MasterServiceConfig& config)
                         std::unordered_set<std::string> keys;
                     };
                     if (plan.target_bytes == 0) return ErrorCode::OK;
+                    // A tier-down plan copies objects down and keeps their
+                    // MEMORY replica, so it frees nothing. Only the reclaim share
+                    // of the plan may drive the legacy fallback below: counting
+                    // the demotion budget as a shortfall would make the fallback
+                    // evict exactly the keys the driver just chose to keep.
+                    const uint64_t tier_down_target =
+                        std::min(plan.tier_down_target_bytes,
+                                 plan.target_bytes);
+                    const uint64_t reclaim_target =
+                        plan.target_bytes - tier_down_target;
                     uint64_t total_freed = 0;
+                    uint64_t tier_down_attempts = 0;
+                    uint64_t tier_down_queued = 0;
+                    uint64_t tier_down_failed = 0;
                     std::unordered_map<TenantId, TenantCandidates, TenantIdHash>
                         targets;
                     for (const auto& candidate : plan.candidates) {
+                        // The action is per candidate and comes from the plan
+                        // (which got it from the driver), never from
+                        // target_tier. A kTierDown candidate is copied down and
+                        // keeps its MEMORY replica, so it is excluded from the
+                        // quota eviction below and from freed accounting.
+                        if (candidate.action ==
+                            io_pattern::EvictionAction::kTierDown) {
+                            ++tier_down_attempts;
+                            if (TryQueueTierDown(ObjectIdentity{
+                                    candidate.object.tenant_id,
+                                    candidate.object.key})) {
+                                ++tier_down_queued;
+                            } else {
+                                ++tier_down_failed;
+                            }
+                            continue;
+                        }
                         auto& target = targets[candidate.object.tenant_id];
                         target.bytes += candidate.bytes;
                         target.keys.insert(candidate.object.key);
+                    }
+                    if (tier_down_attempts != 0) {
+                        tier_down_attempts_.fetch_add(
+                            tier_down_attempts, std::memory_order_relaxed);
+                        tier_down_successes_.fetch_add(
+                            tier_down_queued, std::memory_order_relaxed);
+                        tier_down_failures_.fetch_add(
+                            tier_down_failed, std::memory_order_relaxed);
+                        LOG(WARNING)
+                            << "[IO-PATTERN-TIER-DOWN] io_pattern tier down "
+                               "plan_target="
+                            << tier_down_target
+                            << " attempts=" << tier_down_attempts
+                            << " queued=" << tier_down_queued
+                            << " failed=" << tier_down_failed;
                     }
                     for (const auto& [tenant, target] : targets) {
                         const auto result = EvictTenantMemoryForQuota(
@@ -599,22 +668,27 @@ MasterService::MasterService(const MasterServiceConfig& config)
                     LOG(WARNING)
                         << "[IO-PATTERN-EVICT-DIAG] io_pattern eviction "
                            "summary plan_target="
-                        << plan.target_bytes << " total_freed=" << total_freed
+                        << plan.target_bytes
+                        << " reclaim_target=" << reclaim_target
+                        << " total_freed=" << total_freed
                         << " candidates=" << plan.candidates.size();
-                    if (total_freed >= plan.target_bytes) {
+                    if (total_freed >= reclaim_target) {
                         return ErrorCode::OK;
                     }
-                    // The plan under-delivered: its candidates may be stale, may
-                    // still hold leases or pins, or may be empty. Fall back to
-                    // the legacy lease-ordered eviction so the watermark request
-                    // still makes progress. This covers both the local watermark
+                    // The plan under-delivered its *reclaim* target: its
+                    // candidates may be stale, may still hold leases or pins, or
+                    // may be empty. Fall back to the legacy lease-ordered
+                    // eviction so the watermark request still makes progress.
+                    // This covers both the local watermark
                     // thread and the report-driven worker, which is why the
-                    // thread no longer runs its own fallback.
-                    const uint64_t shortfall = plan.target_bytes - total_freed;
+                    // thread no longer runs its own fallback. The tier-down share
+                    // of the plan is deliberately excluded from the shortfall: a
+                    // demotion is not a failed reclaim.
+                    const uint64_t shortfall = reclaim_target - total_freed;
                     LOG(WARNING)
                         << "[IO-PATTERN-EVICT-FALLBACK] policy plan under-"
-                           "delivered plan_target="
-                        << plan.target_bytes << " freed=" << total_freed
+                           "delivered reclaim_target="
+                        << reclaim_target << " freed=" << total_freed
                         << " shortfall=" << shortfall;
                     return RunLegacyEvictionFallback(shortfall)
                                ? ErrorCode::OK
@@ -8299,6 +8373,54 @@ tl::expected<std::vector<UUID>, ErrorCode> MasterService::PushOffloadingQueue(
         queued_clients.push_back(client_id_it->second);
     }
     return queued_clients;
+}
+
+// Policy-driven tier down: queue one MEMORY replica of `object_id` for a
+// LOCAL_DISK copy, keeping the MEMORY replica in place. Shares the offload
+// bookkeeping used by the offload-on-evict path (refcnt pin plus an
+// offloading_tasks entry, both released when the client reports the copy back),
+// and deliberately frees nothing: demotion is a copy, not a reclaim.
+bool MasterService::TryQueueTierDown(const ObjectIdentity& object_id) {
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) {
+        return false;
+    }
+    auto& metadata = accessor.Get();
+    auto& tenant_state = accessor.GetTenantState();
+
+    // One offload per key. An in-flight task already pins the MEMORY replica this
+    // demotion would pin again, and the holder's queue is keyed by the object, so
+    // re-pushing would only fail with OBJECT_ALREADY_EXISTS. The key is already
+    // on its way down, which is what the caller asked for.
+    if (tenant_state.offloading_tasks.count(object_id.user_key) > 0) {
+        return true;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    bool queued = false;
+    metadata.VisitReplicas(
+        [](const Replica& replica) {
+            return replica.is_completed() && replica.is_memory_replica();
+        },
+        [this, &object_id, &tenant_state, &now, &queued](Replica& replica) {
+            if (queued) return;  // only one replica needs to be copied down
+            auto result = PushOffloadingQueue(object_id, replica);
+            if (!result || result.value().empty()) {
+                VLOG(1) << "tier_down_push_failed key=" << object_id.user_key
+                        << " error="
+                        << (result ? "empty_result" : toString(result.error()))
+                        << " replica_segments="
+                        << replica.get_segment_names().size();
+                return;
+            }
+            auto& tasks = tenant_state.offloading_tasks[object_id.user_key];
+            for (const auto& client_id : result.value()) {
+                replica.inc_refcnt();
+                tasks.push_back(OffloadingTask{replica.id(), now, client_id});
+            }
+            queued = true;
+        });
+    return queued;
 }
 
 // Promotion-on-hit

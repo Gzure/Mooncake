@@ -260,7 +260,7 @@ PolicyResult IoPatternRuntime::Plan(
 IoPatternRuntime::PlannedPolicy IoPatternRuntime::BuildPolicy(
     CacheTier eviction_tier, uint64_t eviction_bytes, const TraceHistory& trace,
     const std::vector<ObjectRef>& admissions, const std::string& session_id,
-    uint64_t min_idle_time_us) {
+    uint64_t min_idle_time_us, bool tier_down) {
     PlannedPolicy planned;
     planned.snapshot = collector_->GetSnapshot();
     const auto start = std::chrono::steady_clock::now();
@@ -279,7 +279,8 @@ IoPatternRuntime::PlannedPolicy IoPatternRuntime::BuildPolicy(
         PolicyContext{.snapshot = planned.snapshot,
                       .analysis = analysis,
                       .session_id = session_id,
-                      .min_idle_time_us = min_idle_time_us},
+                      .min_idle_time_us = min_idle_time_us,
+                      .tier_down = tier_down},
         eviction_tier, eviction_bytes, CacheTier::kL1Host, trace, admissions);
     planned.result.degraded =
         planned.result.degraded || collector_->degraded() ||
@@ -485,12 +486,31 @@ void IoPatternRuntime::RunReportDrivenCycle() {
     DeriveEvictionRequest(snapshot, config_.report_eviction_high_ratio,
                           config_.report_eviction_target_ratio, eviction_tier,
                           eviction_bytes);
+    // Tier-down driver: the below-watermark placement action. Copy the coldest
+    // in-memory keys down to LOCAL_DISK while keeping their MEMORY replica, so a
+    // later reclaim of those keys can discard them safely instead of copying then.
+    // A demotion frees nothing, so it must never win over a reclaim: the pressure
+    // request above takes the cycle whenever the watermark is reached, and this
+    // driver only fills the cycle that would otherwise do nothing. The budget is
+    // the whole control (no enable flag); the driver decides the action here, and
+    // the policy must never derive it from target_tier.
+    bool tier_down = false;
+    if (eviction_bytes == 0 && config_.tier_down_bytes_per_cycle != 0) {
+        eviction_bytes = config_.tier_down_bytes_per_cycle;
+        tier_down = true;
+        report.tier_down = true;
+    }
     // Cold-data eviction driver: when the merged storage watermark does not
     // trigger a pressure eviction but the analysis-relevant snapshot contains
     // idle L1 keys, run a bounded eviction of the coldest keys so eviction is
     // driven by cold/hot analysis and not only by memory pressure. Candidate
     // selection still goes through the policy engine (ScoreBasedEvictionOps
     // ranks the coldest first); this driver only supplies a byte target.
+    //
+    // It also acts below the watermark, but it reclaims instead of placing, so it
+    // only takes the slot when no tier-down budget is configured: demoting a key
+    // the same cycle would have discarded defeats the point of paving cold data
+    // down first.
     uint64_t cold_idle_threshold_us = 0;
     if (eviction_bytes == 0 && config_.report_driven_cold_eviction &&
         config_.report_driven_cold_eviction_bytes != 0) {
@@ -509,7 +529,7 @@ void IoPatternRuntime::RunReportDrivenCycle() {
 
     auto planned = BuildPolicy(eviction_tier, eviction_bytes, trace,
                                admissions, "report-driven",
-                               cold_idle_threshold_us);
+                               cold_idle_threshold_us, tier_down);
     report.analysis_elapsed_us = planned.analysis_elapsed_us;
     const auto& result = planned.result;
     report.eviction_candidates = result.eviction.candidates.size();

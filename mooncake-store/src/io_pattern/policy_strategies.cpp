@@ -59,6 +59,16 @@ EvictionPlan ScoreBasedEvictionOps::Evaluate(const PolicyContext& context,
                                               CacheTier tier,
                                               uint64_t target_bytes) const {
     EvictionPlan plan{.source_tier = tier, .target_bytes = target_bytes};
+    // The driver owns the action: a tier-down pass selects the same victims an
+    // eviction pass would, and only the executor's action differs. Deriving it
+    // from target_tier is not possible -- TierDownTarget() returns source+1 for
+    // L0/L1/L2 alike, so every candidate would look like a demotion.
+    const EvictionAction action = context.tier_down
+                                      ? EvictionAction::kTierDown
+                                      : EvictionAction::kEvict;
+    if (context.tier_down) {
+        plan.tier_down_target_bytes = target_bytes;
+    }
     uint64_t max_block_size = 0;
     uint32_t max_other_replicas = 0;
     for (const auto& key : context.snapshot.keys) {
@@ -127,7 +137,8 @@ EvictionPlan ScoreBasedEvictionOps::Evaluate(const PolicyContext& context,
                               .bytes = key.block_size,
                               .score = score,
                               .target_tier = TierDownTarget(
-                                  tier, config_.tier_down_mode)});
+                                  tier, config_.tier_down_mode),
+                              .action = action});
     }
     std::sort(plan.candidates.begin(), plan.candidates.end(),
               [](const EvictionCandidate& lhs, const EvictionCandidate& rhs) {

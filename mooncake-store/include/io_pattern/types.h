@@ -209,6 +209,14 @@ struct PolicyContext {
     // the byte target, so the budget and the selected victims describe the same
     // keys. 0 disables the gate.
     uint64_t min_idle_time_us{0};
+    // Tier-down driver gate. When set, the strategy labels the candidates it
+    // selects as kTierDown instead of kEvict: the same victims are chosen, but
+    // the executor copies them down instead of reclaiming them. The action is
+    // decided by the driver here and can never be derived from a candidate's
+    // target_tier: TierDownTarget() returns source+1 for every tier it is given,
+    // so deriving it would label every candidate a demotion and disable eviction
+    // entirely.
+    bool tier_down{false};
 };
 
 struct TraceEvent {
@@ -243,17 +251,37 @@ struct PrefetchPlan {
     std::vector<PrefetchCandidate> candidates;
 };
 
+// What the executor must do with one selected candidate. Chosen by the driver
+// that built the plan (PolicyContext::tier_down), never inferred from
+// target_tier: see PolicyContext::tier_down.
+enum class EvictionAction : uint8_t {
+    // Reclaim the MEMORY replica (the original behaviour).
+    kEvict,
+    // Copy the object down to LOCAL_DISK and keep the MEMORY replica, so a later
+    // Get still hits memory and nothing is freed by this action.
+    kTierDown,
+};
+
 struct EvictionCandidate {
     ObjectRef object;
     uint64_t bytes{0};
     float score{0.0F};
     CacheTier target_tier{CacheTier::kL3NofSsd};
+    // Appended last so existing positional and designated initializers keep
+    // their meaning; the default preserves the previous reclaim semantics for
+    // every producer that does not set an action.
+    EvictionAction action{EvictionAction::kEvict};
 };
 
 struct EvictionPlan {
     CacheTier source_tier{CacheTier::kL0Hbm};
     uint64_t target_bytes{0};
     std::vector<EvictionCandidate> candidates;
+    // How many of target_bytes are meant to be demoted rather than reclaimed.
+    // 0 for a pure eviction plan. This rides the CFM wire so a remote executor
+    // can tell a tier-down budget from a reclaim budget instead of treating the
+    // whole plan as memory to free.
+    uint64_t tier_down_target_bytes{0};
 };
 
 enum class AdmissionDecision : uint8_t {

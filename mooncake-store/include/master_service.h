@@ -993,6 +993,22 @@ class MasterService {
      */
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
+    /**
+     * @brief Policy-driven tier-down dispatch counters. Independent of the
+     * eviction counters because a demotion copies an object down and keeps its
+     * MEMORY replica: it frees no bytes, so folding it into freed memory would
+     * make a tier-down plan look like a plan that under-delivered.
+     */
+    uint64_t tier_down_attempt_count() const {
+        return tier_down_attempts_.load(std::memory_order_relaxed);
+    }
+    uint64_t tier_down_success_count() const {
+        return tier_down_successes_.load(std::memory_order_relaxed);
+    }
+    uint64_t tier_down_failure_count() const {
+        return tier_down_failures_.load(std::memory_order_relaxed);
+    }
+
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
 
@@ -1786,6 +1802,20 @@ class MasterService {
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true);
+
+    /**
+     * @brief Queue one MEMORY replica of `object_id` for a LOCAL_DISK copy
+     * (tier down) and keep the MEMORY replica in place.
+     *
+     * This is the demotion counterpart of an eviction: it never removes a
+     * replica and never frees bytes, so the caller must not count its result as
+     * reclaimed memory. Acquires its own RW shard accessor; safe to call from
+     * the io_pattern eviction handler, which does not hold one while this runs.
+     * Returns false when the key vanished, has no completed MEMORY replica, or
+     * the holder client cannot accept the offload. A key that is already queued
+     * counts as success: it is already on its way down.
+     */
+    bool TryQueueTierDown(const ObjectIdentity& object_id);
     void RecordOrUpdateCandidate(TenantState& tenant_state,
                                  const std::string& key, uint8_t sketch_score,
                                  PromotionCandidateReason reason,
@@ -2252,6 +2282,15 @@ class MasterService {
     // or credential is needed.
     std::shared_ptr<io_pattern::IoPatternRuntime> io_pattern_runtime_;
     std::shared_ptr<io_pattern::CfmService> io_pattern_cfm_service_;
+
+    // Policy-driven tier down. Kept separate from the eviction counters because a
+    // demotion queues a disk copy and frees no memory: folding it into freed
+    // bytes would make a tier-down plan look like a plan that under-delivered.
+    // Written only from the io_pattern eviction handler; relaxed order is enough
+    // because these are advisory observability counters.
+    std::atomic<uint64_t> tier_down_attempts_{0};
+    std::atomic<uint64_t> tier_down_successes_{0};
+    std::atomic<uint64_t> tier_down_failures_{0};
 
     const std::string ha_backend_type_;
 
