@@ -514,6 +514,34 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << ", status=" << static_cast<int>(rpt.admission_status)
                       << ")";
         };
+    // Promotion is the Store's only cross-tier primitive, and it can decline for
+    // structural reasons the policy cannot influence: promotion disabled, no
+    // LOCAL_DISK source replica, or watermark / queue-cap / second-touch
+    // backpressure. Those map to UNAVAILABLE_IN_CURRENT_MODE so the runtime
+    // records a skip instead of a policy failure -- otherwise three such cycles
+    // would permanently replace the workload policy with the legacy fallback.
+    // Only a vanished object or a genuine enqueue failure stays an error.
+    // Captured by value: a captureless lambda is an empty, copyable type, so no
+    // local outlives this constructor.
+    const auto promotion_outcome_to_error =
+        [](PromotionQueueResult outcome) -> ErrorCode {
+        switch (outcome) {
+            case PromotionQueueResult::kQueued:
+            case PromotionQueueResult::kAlreadyInFlight:
+            case PromotionQueueResult::kMemoryReplicaPresent:
+                return ErrorCode::OK;
+            case PromotionQueueResult::kDisabled:
+            case PromotionQueueResult::kFrequencyRejected:
+            case PromotionQueueResult::kWatermarkRejected:
+            case PromotionQueueResult::kQueueCapRejected:
+            case PromotionQueueResult::kNoLocalDiskSource:
+                return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+            case PromotionQueueResult::kNotFound:
+            case PromotionQueueResult::kPushFailed:
+                return ErrorCode::OBJECT_NOT_FOUND;
+        }
+        return ErrorCode::OBJECT_NOT_FOUND;
+    };
     io_pattern_runtime_ = std::make_shared<io_pattern::IoPatternRuntime>(
         io_pattern::IoPatternRuntime::Handlers{
             .eviction =
@@ -567,7 +595,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                : ErrorCode::OBJECT_NOT_FOUND;
                 },
             .prefetch =
-                [this](const io_pattern::PrefetchPlan& plan) {
+                [this, promotion_outcome_to_error](
+                    const io_pattern::PrefetchPlan& plan) -> ErrorCode {
                     for (const auto& candidate : plan.candidates) {
                         // Store's safe promotion primitive is LOCAL_DISK ->
                         // MEMORY; HBM remains inference-runtime-owned and is
@@ -578,26 +607,25 @@ MasterService::MasterService(const MasterServiceConfig& config)
                         }
                         const ObjectIdentity object_id{
                             candidate.object.tenant_id, candidate.object.key};
-                        if (TryPushPromotionQueue(object_id,
-                                                  /*record_candidate=*/false) !=
-                            PromotionQueueResult::kQueued) {
-                            return ErrorCode::OBJECT_NOT_FOUND;
+                        const auto code = promotion_outcome_to_error(
+                            TryPushPromotionQueue(object_id,
+                                                  /*record_candidate=*/false));
+                        if (code != ErrorCode::OK) {
+                            return code;
                         }
                     }
                     return ErrorCode::OK;
                 },
             .admission =
-                [this](const io_pattern::AdmissionResult& result) {
+                [this, promotion_outcome_to_error](
+                    const io_pattern::AdmissionResult& result) -> ErrorCode {
                     if (result.target_tier == io_pattern::CacheTier::kL0Hbm) {
                         return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
                     }
                     const ObjectIdentity object_id{result.object.tenant_id,
                                                    result.object.key};
-                    return TryPushPromotionQueue(object_id,
-                                                 /*record_candidate=*/false) ==
-                                   PromotionQueueResult::kQueued
-                               ? ErrorCode::OK
-                               : ErrorCode::OBJECT_NOT_FOUND;
+                    return promotion_outcome_to_error(TryPushPromotionQueue(
+                        object_id, /*record_candidate=*/false));
                 }},
         std::move(io_pattern_config));
     io_pattern_cfm_service_ = std::make_shared<io_pattern::CfmService>(
@@ -9865,6 +9893,10 @@ MasterService::EvictTenantMemoryForQuota(
         size_t diag_candidate_skipped_lease = 0;
         size_t diag_candidate_skipped_replica = 0;
         size_t diag_candidate_evicted = 0;
+        size_t diag_no_evictable_has_mem = 0;
+        size_t diag_no_evictable_completed = 0;
+        size_t diag_no_evictable_refcnt = 0;
+        size_t diag_no_evictable_unreadable = 0;
         for (size_t scanned = 0;
              scanned < kNumShards && total.freed_bytes < target_bytes;
              ++scanned) {
@@ -9900,6 +9932,30 @@ MasterService::EvictTenantMemoryForQuota(
                                 ++diag_candidate_skipped_lease;
                             } else {
                                 ++diag_candidate_skipped_replica;
+                                // Replica-level breakdown for why no evictable
+                                // MEMORY replica exists.
+                                bool diag_has_mem = false;
+                                bool diag_all_completed = true;
+                                bool diag_any_refcnt = false;
+                                bool diag_any_unreadable = false;
+                                metadata.VisitReplicas(
+                                    [&](const Replica& r) {
+                                        if (r.is_memory_replica()) {
+                                            diag_has_mem = true;
+                                            if (!r.is_completed())
+                                                diag_all_completed = false;
+                                            if (r.get_refcnt() != 0)
+                                                diag_any_refcnt = true;
+                                            if (!IsReplicaReadable(r))
+                                                diag_any_unreadable = true;
+                                        }
+                                    });
+                                diag_no_evictable_has_mem += diag_has_mem;
+                                diag_no_evictable_completed +=
+                                    diag_all_completed;
+                                diag_no_evictable_refcnt += diag_any_refcnt;
+                                diag_no_evictable_unreadable +=
+                                    diag_any_unreadable;
                             }
                         }
                         ++it;
@@ -9937,6 +9993,10 @@ MasterService::EvictTenantMemoryForQuota(
                 << " skipped_lease=" << diag_candidate_skipped_lease
                 << " skipped_no_evictable_replica="
                 << diag_candidate_skipped_replica
+                << " (has_mem=" << diag_no_evictable_has_mem
+                << " completed=" << diag_no_evictable_completed
+                << " any_refcnt=" << diag_no_evictable_refcnt
+                << " any_unreadable=" << diag_no_evictable_unreadable << ")"
                 << " evicted=" << diag_candidate_evicted
                 << " freed_bytes=" << total.freed_bytes;
         }

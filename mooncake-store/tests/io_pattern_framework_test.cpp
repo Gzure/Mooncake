@@ -1743,5 +1743,53 @@ TEST(IoPatternFrameworkTest, OwnershipClientBucketsReportsByResolvedOwner) {
     server.stop();
 }
 
+TEST(IoPatternFrameworkTest, UnavailablePrefetchCapabilityDoesNotDegradePolicy) {
+    // The prefetch handler's own primitive can be structurally unavailable:
+    // promotion may be disabled, or the object may have no LOCAL_DISK source
+    // replica to promote from. The policy cannot influence either outcome, so
+    // repeating cycles must not be counted as policy failure -- otherwise the
+    // whole workload policy is permanently replaced by the legacy fallback.
+    int prefetch_calls = 0;
+    IoPatternRuntime runtime(IoPatternRuntime::Handlers{
+        .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+        .prefetch =
+            [&prefetch_calls](const PrefetchPlan&) {
+                ++prefetch_calls;
+                return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+            },
+        .admission = [](const AdmissionResult&) { return ErrorCode::OK; }});
+
+    AccessRecord access{.object = {TenantId("tenant-a"), "cold-key"},
+                        .block_size = 1024,
+                        .tier = CacheTier::kL3NofSsd,
+                        .operation = IoOperation::kGet,
+                        .is_hit = true};
+    // A recommendation-shaped key yields a definitive workload classification
+    // and a confidence of 1.0, so the prefetch gate is genuinely exercised.
+    for (int i = 0; i < 21; ++i) {
+        runtime.RecordAccess(access.object.key, access);
+    }
+    runtime.ReportInferenceMetrics(
+        InferenceMetrics{.object = access.object, .match_length = 300});
+
+    TraceHistory trace;
+    trace.events.push_back(
+        TraceEvent{.object = access.object, .match_length = 300, .is_hit = true});
+
+    // Three consecutive reported failures is the DegradingPolicyEngine
+    // threshold used by the runtime. The short pause lets the analyzer thread
+    // of the previous cycle clear its in-flight flag, which would otherwise
+    // mark a cycle degraded for reasons unrelated to this test.
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        runtime.Execute(CacheTier::kL1Host, 0, trace, {});
+    }
+
+    ASSERT_GE(prefetch_calls, 1) << "the prefetch handler must be exercised";
+    EXPECT_FALSE(runtime.degraded())
+        << "a structurally unavailable prefetch primitive is not a policy "
+           "failure";
+}
+
 }  // namespace
 }  // namespace mooncake::io_pattern

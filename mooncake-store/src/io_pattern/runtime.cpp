@@ -6,6 +6,17 @@
 #include <thread>
 
 namespace mooncake::io_pattern {
+namespace {
+
+// A dimension that reported UNAVAILABLE_IN_CURRENT_MODE declined to act because
+// the storage primitive cannot run in this configuration. The policy cannot
+// influence that outcome, so it is not a policy failure.
+bool IsPolicyFailure(ErrorCode code) {
+    return code != ErrorCode::OK &&
+           code != ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+}
+
+}  // namespace
 
 IoPatternRuntime::IoPatternRuntime(Handlers handlers)
     : IoPatternRuntime(std::move(handlers), Config{}) {}
@@ -197,8 +208,8 @@ PolicyExecutionStatus IoPatternRuntime::CommitPolicy(PlannedPolicy& planned) {
     const auto& result = planned.result;
     auto status = executor_.Execute(result);
     status.degraded = status.degraded || result.degraded;
-    const bool failed = status.eviction != ErrorCode::OK ||
-                        status.prefetch != ErrorCode::OK || status.degraded;
+    const bool failed = IsPolicyFailure(status.eviction) ||
+                        IsPolicyFailure(status.prefetch) || status.degraded;
     if (failed)
         policy_->RecordFailure();
     else
@@ -595,7 +606,7 @@ ErrorCode IoPatternRuntime::ExecuteAdmission(const ObjectRef& object,
     if (analysis_degraded) status.degraded = true;
     const auto code = status.admissions.empty() ? ErrorCode::OK
                                                  : status.admissions.front();
-    if (code != ErrorCode::OK || status.degraded)
+    if (IsPolicyFailure(code) || status.degraded)
         observability_.RecordDegrade();
     return code;
 }
