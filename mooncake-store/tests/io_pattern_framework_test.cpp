@@ -544,7 +544,7 @@ TEST(IoPatternFrameworkTest, TracePrefetchPlansOnlyLongPrefixMatches) {
     KeyMetrics key;
     key.object = {TenantId("tenant-a"), "block"};
     key.block_size = 4096;
-    key.replica_tiers = CacheTierBit(CacheTier::kL3NofSsd);
+    key.replica_tiers = CacheTierBit(CacheTier::kLocalDisk);
     context.snapshot.keys.push_back(key);
     // The prefetch gate also requires analyzer confidence, so supply the key
     // pattern the production pipeline would derive for this object.
@@ -559,8 +559,8 @@ TEST(IoPatternFrameworkTest, TracePrefetchPlansOnlyLongPrefixMatches) {
 
     const auto plan = prefetch.Evaluate(context, trace);
     ASSERT_EQ(plan.candidates.size(), 1);
-    EXPECT_EQ(plan.candidates.front().source_tier, CacheTier::kL3NofSsd);
-    EXPECT_EQ(plan.candidates.front().target_tier, CacheTier::kL2Segment);
+    EXPECT_EQ(plan.candidates.front().source_tier, CacheTier::kLocalDisk);
+    EXPECT_EQ(plan.candidates.front().target_tier, CacheTier::kL1Host);
     EXPECT_EQ(plan.candidates.front().bytes, 4096);
 }
 
@@ -570,7 +570,7 @@ TEST(IoPatternFrameworkTest, TracePrefetchDeduplicatesObjects) {
     KeyMetrics key;
     key.object = {TenantId("tenant-a"), "block"};
     key.block_size = 128;
-    key.replica_tiers = CacheTierBit(CacheTier::kL2Segment);
+    key.replica_tiers = CacheTierBit(CacheTier::kLocalDisk);
     context.snapshot.keys.push_back(key);
     // The prefetch gate also requires analyzer confidence, so supply the key
     // pattern the production pipeline would derive for this object.

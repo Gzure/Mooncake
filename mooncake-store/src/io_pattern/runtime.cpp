@@ -449,8 +449,14 @@ TraceHistory IoPatternRuntime::DeriveTraceHistory(
             .count());
     for (const auto& key : snapshot.keys) {
         if (!key.active || key.access_count_window == 0) continue;
-        if ((key.replica_tiers & CacheTierBit(CacheTier::kL2Segment)) == 0 &&
-            (key.replica_tiers & CacheTierBit(CacheTier::kL3NofSsd)) == 0) {
+        // Any replica deeper than host memory is a promotion candidate; local
+        // disk is the only one the store can actually move up, but the others
+        // still belong in the trace so the ops layer decides.
+        const bool has_lower_replica =
+            (key.replica_tiers & CacheTierBit(CacheTier::kLocalDisk)) != 0 ||
+            (key.replica_tiers & CacheTierBit(CacheTier::kL2Segment)) != 0 ||
+            (key.replica_tiers & CacheTierBit(CacheTier::kL3NofSsd)) != 0;
+        if (!has_lower_replica) {
             continue;
         }
         trace.events.push_back(
@@ -474,6 +480,7 @@ std::vector<ObjectRef> IoPatternRuntime::DeriveAdmissionCandidates(
         const bool in_head =
             (key.replica_tiers & CacheTierBit(CacheTier::kL1Host)) != 0;
         const bool lower_tier =
+            (key.replica_tiers & CacheTierBit(CacheTier::kLocalDisk)) != 0 ||
             (key.replica_tiers & CacheTierBit(CacheTier::kL2Segment)) != 0 ||
             (key.replica_tiers & CacheTierBit(CacheTier::kL3NofSsd)) != 0;
         if (!in_head && lower_tier) candidates.push_back(key.object);

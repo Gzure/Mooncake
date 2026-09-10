@@ -4612,9 +4612,14 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
                 std::chrono::steady_clock::now().time_since_epoch())
                 .count());
         io_access.block_size = metadata.size;
+        // LOCAL_DISK is reported as its own tier: it is the only tier the store
+        // can promote from, and collapsing it into kL3NofSsd made local-disk and
+        // NoF-only objects indistinguishable to the policy.
         io_access.tier = resp.replicas[0].is_memory_replica()
                              ? io_pattern::CacheTier::kL1Host
-                             : io_pattern::CacheTier::kL3NofSsd;
+                             : (resp.replicas[0].is_local_disk_replica()
+                                    ? io_pattern::CacheTier::kLocalDisk
+                                    : io_pattern::CacheTier::kL3NofSsd);
         io_access.operation = io_pattern::IoOperation::kGet;
         io_access.is_hit = true;
         record_io_access = true;
@@ -4867,7 +4872,11 @@ MasterService::BatchGetReplicaListLocal(const std::vector<std::string>& keys,
                      .tier =
                          results[original_idx]->replicas[0].is_memory_replica()
                              ? io_pattern::CacheTier::kL1Host
-                             : io_pattern::CacheTier::kL3NofSsd,
+                             : (results[original_idx]
+                                        ->replicas[0]
+                                        .is_local_disk_replica()
+                                    ? io_pattern::CacheTier::kLocalDisk
+                                    : io_pattern::CacheTier::kL3NofSsd),
                      .operation = io_pattern::IoOperation::kGet,
                      .is_hit = true});
             }
@@ -5597,7 +5606,9 @@ auto MasterService::PutEndInternal(
                   .block_size = metadata.size,
                   .tier = replica_type == ReplicaType::MEMORY
                               ? io_pattern::CacheTier::kL1Host
-                              : io_pattern::CacheTier::kL3NofSsd,
+                              : (replica_type == ReplicaType::LOCAL_DISK
+                                     ? io_pattern::CacheTier::kLocalDisk
+                                     : io_pattern::CacheTier::kL3NofSsd),
                   .operation = io_pattern::IoOperation::kPut,
                   .is_hit = true,
                   .write_batch_size = write_batch_size,

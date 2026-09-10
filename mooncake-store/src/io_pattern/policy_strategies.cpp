@@ -207,11 +207,13 @@ PrefetchPlan TraceBasedPrefetchOps::Evaluate(
         if (candidate.confidence < config_.minimum_confidence) {
             continue;
         }
-        if (key->replica_tiers & CacheTierBit(CacheTier::kL3NofSsd)) {
-            candidate.source_tier = CacheTier::kL3NofSsd;
-            candidate.target_tier = CacheTier::kL2Segment;
-        } else if (key->replica_tiers & CacheTierBit(CacheTier::kL2Segment)) {
-            candidate.source_tier = CacheTier::kL2Segment;
+        // Only one hop is real: the store promotes a LOCAL_DISK replica into
+        // host memory. There is no L3 -> L2 or L2 -> L1 mover, so reporting a
+        // fabricated kL2Segment target made every candidate look executable
+        // while the handler could only ever promote a local-disk source -- a
+        // NoF-only object therefore produced a plan the executor had to reject.
+        if (key->replica_tiers & CacheTierBit(CacheTier::kLocalDisk)) {
+            candidate.source_tier = CacheTier::kLocalDisk;
             candidate.target_tier = CacheTier::kL1Host;
         } else {
             continue;
