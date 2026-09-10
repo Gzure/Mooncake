@@ -707,7 +707,7 @@ TEST(IoPatternFrameworkTest, UnifiedPolicyResultSeamDelegates) {
     PolicyContext context;
     context.snapshot = snapshot;
     const auto result = engine.ExecutePolicy(
-        context, CacheTier::kL1Host, 1024, {}, {key.object});
+        context, CacheTier::kL1Host, 1024, CacheTier::kL1Host, {}, {key.object});
     EXPECT_EQ(result.admissions.size(), 1);
     EXPECT_EQ(result.admissions.front().object, key.object);
 }
@@ -722,13 +722,15 @@ TEST(IoPatternFrameworkTest, RegistryPolicyEngineResolvesNamedOps) {
         "prefix", [] { return std::make_shared<PrefixMatchAdmissionOps>(); }));
     RegistryPolicyEngine engine(registries, "score", "trace", "prefix");
     const ObjectRef object{TenantId("tenant-a"), "key"};
-    const auto result = engine.ExecutePolicy({}, CacheTier::kL1Host, 1024, {},
-                                             {object});
+    const auto result = engine.ExecutePolicy(
+        {}, CacheTier::kL1Host, 1024, CacheTier::kL1Host, {}, {object});
     ASSERT_EQ(result.admissions.size(), 1);
     EXPECT_EQ(result.admissions.front().object, object);
 
     RegistryPolicyEngine missing(registries, "missing", "trace", "prefix");
-    EXPECT_TRUE(missing.ExecutePolicy({}, CacheTier::kL1Host, 0, {}).degraded);
+    EXPECT_TRUE(
+        missing.ExecutePolicy({}, CacheTier::kL1Host, 0, CacheTier::kL1Host, {})
+            .degraded);
 }
 
 TEST(IoPatternFrameworkTest, ReporterBatchesBoundsAndCountsDrops) {

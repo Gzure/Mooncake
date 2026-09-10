@@ -31,9 +31,15 @@ class PolicyEngine {
         const PolicyContext& context) const = 0;
 
     // Executes the three policy dimensions through one uniform result seam.
+    // Eviction and admission target different tiers: an eviction plan reclaims
+    // from `eviction_tier`, while each admission decides whether an object may
+    // enter `admission_tier`. The two are passed separately because using the
+    // eviction tier as the admission target silently applied the eviction tier's
+    // watermark and prefix gates to the promotion decision.
     virtual PolicyResult ExecutePolicy(const PolicyContext& context,
                                        CacheTier eviction_tier,
                                        uint64_t eviction_bytes,
+                                       CacheTier admission_tier,
                                        const TraceHistory& trace,
                                        const std::vector<ObjectRef>& admissions = {}) const {
         PolicyResult result;
@@ -41,7 +47,7 @@ class PolicyEngine {
         result.prefetch = PlanPrefetch(context, trace);
         for (const auto& object : admissions) {
             result.admissions.push_back(
-                DecideAdmission(object, eviction_tier, context));
+                DecideAdmission(object, admission_tier, context));
         }
         return result;
     }
@@ -120,10 +126,11 @@ class RegistryPolicyEngine final : public PolicyEngine {
 
     PolicyResult ExecutePolicy(const PolicyContext& context,
                                CacheTier tier, uint64_t bytes,
+                               CacheTier admission_tier,
                                const TraceHistory& trace,
                                const std::vector<ObjectRef>& admissions = {}) const override {
-        auto result = PolicyEngine::ExecutePolicy(context, tier, bytes, trace,
-                                                  admissions);
+        auto result = PolicyEngine::ExecutePolicy(
+            context, tier, bytes, admission_tier, trace, admissions);
         std::shared_lock lock(mutex_);
         result.degraded = !registries_ ||
                           !registries_->eviction.Create(eviction_name_) ||

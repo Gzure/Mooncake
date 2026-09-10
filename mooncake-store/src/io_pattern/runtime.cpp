@@ -274,8 +274,8 @@ IoPatternRuntime::PlannedPolicy IoPatternRuntime::BuildPolicy(
     workload_policy_->AdvanceTransitionWindow();
     planned.result = policy_->ExecutePolicy(
         PolicyContext{.snapshot = planned.snapshot, .analysis = analysis,
-                      .session_id = session_id}, eviction_tier,
-        eviction_bytes, trace, admissions);
+                      .session_id = session_id},
+        eviction_tier, eviction_bytes, CacheTier::kL1Host, trace, admissions);
     planned.result.degraded =
         planned.result.degraded || collector_->degraded() ||
         planned.analysis_degraded ||
