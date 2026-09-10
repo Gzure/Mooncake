@@ -546,6 +546,10 @@ TEST(IoPatternFrameworkTest, TracePrefetchPlansOnlyLongPrefixMatches) {
     key.block_size = 4096;
     key.replica_tiers = CacheTierBit(CacheTier::kL3NofSsd);
     context.snapshot.keys.push_back(key);
+    // The prefetch gate also requires analyzer confidence, so supply the key
+    // pattern the production pipeline would derive for this object.
+    context.analysis.keys = {
+        KeyPattern{.object = key.object, .confidence = 1.0F}};
 
     TraceHistory trace;
     trace.events.push_back(
@@ -568,6 +572,10 @@ TEST(IoPatternFrameworkTest, TracePrefetchDeduplicatesObjects) {
     key.block_size = 128;
     key.replica_tiers = CacheTierBit(CacheTier::kL2Segment);
     context.snapshot.keys.push_back(key);
+    // The prefetch gate also requires analyzer confidence, so supply the key
+    // pattern the production pipeline would derive for this object.
+    context.analysis.keys = {
+        KeyPattern{.object = key.object, .confidence = 1.0F}};
 
     TraceHistory trace;
     trace.events.push_back(
@@ -1632,8 +1640,11 @@ TEST(IoPatternFrameworkTest, RuntimeConnectsCollectionAnalysisPolicyAndHandlers)
             },
         });
 
+    // observed_at_ns is deliberately left unset so the collector stamps this
+    // access with its own clock: the frequency window is a true rolling window,
+    // so a synthetic epoch timestamp would be pruned and the admission would be
+    // rejected for frequency instead of exercising the handler.
     AccessRecord access{.object = {TenantId("tenant-a"), "runtime-key"},
-                        .observed_at_ns = 1,
                         .block_size = 64,
                         .tier = CacheTier::kL2Segment,
                         .is_hit = true};
