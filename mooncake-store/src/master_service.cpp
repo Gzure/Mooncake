@@ -686,6 +686,47 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                 << "[IO-PATTERN-TIER-DOWN]   candidate "
                                 << diag;
                         }
+                        if (tier_down_paved != 0 && io_pattern_runtime_) {
+                            // The handler reads the authoritative metadata; the
+                            // selector reads the collector snapshot. Log the
+                            // snapshot's view so a disagreement is visible instead
+                            // of looking like a driver that simply has nothing to
+                            // do: metadata=paved with snapshot_paved=0 means the
+                            // replica bit never reached the snapshot.
+                            constexpr io_pattern::CacheTierMask kLowerTierBits =
+                                static_cast<io_pattern::CacheTierMask>(
+                                    io_pattern::CacheTierBit(
+                                        io_pattern::CacheTier::kLocalDisk) |
+                                    io_pattern::CacheTierBit(
+                                        io_pattern::CacheTier::kL2Segment) |
+                                    io_pattern::CacheTierBit(
+                                        io_pattern::CacheTier::kL3NofSsd));
+                            const auto snapshot = io_pattern_runtime_->Snapshot();
+                            size_t snapshot_paved = 0;
+                            for (const auto& candidate : plan.candidates) {
+                                if (candidate.action !=
+                                    io_pattern::EvictionAction::kTierDown) {
+                                    continue;
+                                }
+                                const auto it = std::find_if(
+                                    snapshot.keys.begin(), snapshot.keys.end(),
+                                    [&candidate](
+                                        const io_pattern::KeyMetrics& key) {
+                                        return key.object == candidate.object;
+                                    });
+                                if (it != snapshot.keys.end() &&
+                                    (it->replica_tiers & kLowerTierBits) != 0) {
+                                    ++snapshot_paved;
+                                }
+                            }
+                            LOG(WARNING)
+                                << "[IO-PATTERN-TIER-DOWN]   metadata=paved "
+                                << tier_down_paved << " of "
+                                << tier_down_attempts
+                                << ", snapshot=paved " << snapshot_paved
+                                << " (0 means the replica bit never reached "
+                                   "the snapshot)";
+                        }
                     }
                     for (const auto& [tenant, target] : targets) {
                         const auto result = EvictTenantMemoryForQuota(
@@ -8443,6 +8484,19 @@ MasterService::TierDownOutcome MasterService::TryQueueTierDown(
     // copy. Reported separately from kQueued because a driver that keeps
     // selecting paved keys is not making progress.
     if (metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        // Teach the collector what the metadata already knows. The selector can
+        // only exclude paved keys through the snapshot's replica bits, and those
+        // bits are recorded on the offload-completion path -- which can miss a key
+        // that was re-registered before its first access observation, or have them
+        // overwritten by a merged snapshot. Re-asserting it here is idempotent and
+        // makes the selection converge after one no-op cycle instead of spinning
+        // on the same keys forever.
+        if (io_pattern_runtime_) {
+            io_pattern_runtime_->RecordTierEvent(io_pattern::CacheEvent{
+                .type = io_pattern::CacheEventType::kInserted,
+                .object = {object_id.tenant_id, object_id.user_key},
+                .target_tier = io_pattern::CacheTier::kL3NofSsd});
+        }
         return TierDownOutcome::kAlreadyPaved;
     }
     // A copy is already in flight. Re-pushing would only fail with
