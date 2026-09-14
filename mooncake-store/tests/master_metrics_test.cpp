@@ -1055,6 +1055,11 @@ TEST_F(MasterMetricsTest, AdminMetricsExposeIoPatternFeedbackFromAccesses) {
     EXPECT_NE(response.body.find(
                   "# TYPE master_io_pattern_policy_decisions_total counter"),
               std::string::npos);
+    const auto summary = FetchUrl(http_port, "/metrics/summary");
+    ASSERT_EQ(summary.http_status, 200);
+    EXPECT_NE(summary.body.find("IO Pattern (runtime, lifetime):"),
+              std::string::npos);
+    EXPECT_NE(summary.body.find("feedback_samples=1"), std::string::npos);
     admin_server.Stop();
 }
 

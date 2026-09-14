@@ -2288,6 +2288,23 @@ TEST(IoPatternFrameworkTest, RuntimeMetricsExport) {
     EXPECT_DOUBLE_EQ(value(first, "master_io_pattern_policy_decisions_total"),
                      1.0);
     EXPECT_GT(value(first, "master_io_pattern_policy_decision_qps"), 0.0);
+    // Both the HTTP summary and periodic Master Admin Metrics log must expose
+    // the same runtime and feedback values without consuming the counters.
+    for (const auto& summary :
+         {metrics.get_summary_string(),
+          metrics.get_summary_string_and_update_snapshot()}) {
+        EXPECT_NE(summary.find("IO Pattern (runtime, lifetime):"),
+                  std::string::npos);
+        for (const auto* field :
+             {"collect_latency_max_us=", "analyze_latency_max_us=",
+              "policy_decision_qps=", "policy_decisions=1",
+              "strategy_hit_rate=0", "false_positive_rate=0", "degrade_count=0",
+              "report_drop_count=0", "hit_rate_delta=-0.25",
+              "eviction_churn=0.5", "ttft_delta=-0.125",
+              "prefetch_accuracy=0.75", "feedback_samples=1"}) {
+            EXPECT_NE(summary.find(field), std::string::npos) << field;
+        }
+    }
     // Scrapes must not increment cumulative counters or consume feedback.
     const auto second = metrics.serialize_metrics();
     EXPECT_DOUBLE_EQ(value(second, "master_io_pattern_policy_decisions_total"),
@@ -2308,11 +2325,16 @@ TEST(IoPatternFrameworkTest, RuntimeMetricsExport) {
     EXPECT_DOUBLE_EQ(value(degraded, "master_io_pattern_report_drop_count"),
                      1.0);
     EXPECT_GE(value(degraded, "master_io_pattern_degrade_count"), 1.0);
+    EXPECT_NE(metrics.get_summary_string().find("report_drop_count=1"),
+              std::string::npos);
 
     // The singleton must not retain a runtime (or its MasterService handlers).
     std::weak_ptr<IoPatternRuntime> weak = runtime;
     runtime.reset();
     EXPECT_TRUE(weak.expired());
+    EXPECT_EQ(
+        metrics.get_summary_string().find("IO Pattern (runtime, lifetime):"),
+        std::string::npos);
     EXPECT_EQ(metrics.serialize_metrics().find(
                   "# TYPE master_io_pattern_hit_rate_delta "),
               std::string::npos);
@@ -2325,6 +2347,9 @@ TEST(IoPatternFrameworkTest, RuntimeMetricsExport) {
                            "master_io_pattern_policy_decisions_total"),
                      0.0);
     metrics.clear_io_pattern_runtime(replacement.get());
+    EXPECT_EQ(metrics.get_summary_string_and_update_snapshot().find(
+                  "IO Pattern (feedback, sample window):"),
+              std::string::npos);
     EXPECT_EQ(metrics.serialize_metrics().find(
                   "# TYPE master_io_pattern_hit_rate_delta "),
               std::string::npos);

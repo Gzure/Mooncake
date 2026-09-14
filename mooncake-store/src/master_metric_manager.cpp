@@ -6,6 +6,7 @@
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 #include <cmath>
+#include <optional>
 
 #include "utils.h"
 #include "io_pattern/runtime.h"
@@ -2811,6 +2812,41 @@ std::string MasterMetricManager::get_summary_string(
        << "admit=" << io_pattern_report_admissions_.value() << "/"
        << io_pattern_report_admission_failures_.value() << ", "
        << "degraded=" << io_pattern_report_degraded_.value();
+
+    std::optional<io_pattern::IoPatternObservabilitySnapshot> observation;
+    io_pattern::PolicyFeedbackStats feedback;
+    {
+        // As with /metrics, release the temporary strong reference under the
+        // registration lock so service shutdown cannot race a summary read.
+        std::lock_guard lock(io_pattern_runtime_mutex_);
+        auto runtime = io_pattern_runtime_.lock();
+        if (runtime) {
+            observation = runtime->ObservabilitySnapshot();
+            feedback = runtime->FeedbackSnapshot();
+        }
+    }
+    if (observation) {
+        // Keep precision local: small deltas must remain visible without
+        // changing the formatting of the rest of the admin summary.
+        std::ostringstream io_summary;
+        io_summary
+            << std::setprecision(6) << " | IO Pattern (runtime, lifetime): "
+            << "collect_latency_max_us=" << observation->collect_latency_us
+            << ", analyze_latency_max_us=" << observation->analyze_latency_us
+            << ", policy_decision_qps=" << observation->policy_decision_qps
+            << ", policy_decisions=" << observation->policy_decisions
+            << ", strategy_hit_rate=" << observation->strategy_hit_rate
+            << ", false_positive_rate=" << observation->false_positive_rate
+            << ", degrade_count=" << observation->degrade_count
+            << ", report_drop_count=" << observation->report_drop_count
+            << " | IO Pattern (feedback, sample window): "
+            << "hit_rate_delta=" << feedback.hit_rate_delta
+            << ", eviction_churn=" << feedback.eviction_churn
+            << ", ttft_delta=" << feedback.ttft_delta
+            << ", prefetch_accuracy=" << feedback.prefetch_accuracy
+            << ", feedback_samples=" << feedback.samples;
+        ss << io_summary.str();
+    }
 
     // Discard summary
     ss << " | Discard: "
