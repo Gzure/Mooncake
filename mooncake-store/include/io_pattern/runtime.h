@@ -137,6 +137,15 @@ class IoPatternRuntime final {
         // demotion is never counted as an eviction. There is no separate enable
         // flag: 0 keeps the driver off, so this budget is the whole control.
         uint64_t tier_down_bytes_per_cycle{0};
+        // Periodic driver tick, in milliseconds. Reports only flow while the
+        // workload does, but tier down and cold eviction are exactly the drivers
+        // that must act on an idle cluster, so when either is configured the
+        // report-driven worker also wakes on this interval. A tick cycle
+        // deliberately ignores recorded storage pressure: the master's own
+        // watermark thread owns pressure reclaims (and the ratio it records
+        // lingers in the collector until the next breach), so a tick that also
+        // reclaimed would evict twice for one breach. 0 disables the tick.
+        uint64_t tick_interval_ms{10'000};
         // Optional per-cycle observer used to surface executions in process
         // metrics (e.g. MasterMetricManager). Never called from the report
         // data path; only from the background cycle worker.
@@ -220,7 +229,9 @@ class IoPatternRuntime final {
 
     // Report-driven cycle internals (single background worker).
     void ReportDrivenWorker();
-    void RunReportDrivenCycle();
+    // allow_pressure=false is the periodic-tick path: the pressure request is
+    // skipped so only the below-watermark drivers act.
+    void RunReportDrivenCycle(bool allow_pressure);
     // Runs the executor over an already planned policy and records the shared
     // outcome bookkeeping (policy failure/success, degradation, pending
     // prefetch set and feedback). Used by both Execute() and the

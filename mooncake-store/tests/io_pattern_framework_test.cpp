@@ -1584,6 +1584,160 @@ TEST(IoPatternFrameworkTest, ReportDrivenTierDownPavesColdDataBeforeColdEviction
     }
 }
 
+// The below-watermark drivers must not depend on client reports: reports only
+// flow while the workload does, so an idle cluster would never pave cold data
+// down. The tick lets them run on their own, with no report at all.
+TEST(IoPatternFrameworkTest, ReportDrivenTickRunsTierDownWithoutAnyReport) {
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    std::optional<IoPatternRuntime::ReportDrivenCycleReport> last_report;
+    std::mutex plan_mutex;
+    std::optional<EvictionPlan> handled_plan;
+    IoPatternRuntime::Config config;
+    config.report_driven_execution = true;
+    config.tier_down_bytes_per_cycle = 64ULL * 1024 * 1024;
+    config.tick_interval_ms = 50;
+    config.analysis_timeout_us = 30'000'000;
+    config.report_driven_observer =
+        [&](const IoPatternRuntime::ReportDrivenCycleReport& report) {
+            std::lock_guard lock(observer_mutex);
+            last_report = report;
+            observer_condition.notify_all();
+        };
+    auto rt = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction =
+                [&](const EvictionPlan& plan) {
+                    std::lock_guard lock(plan_mutex);
+                    handled_plan = plan;
+                    return ErrorCode::OK;
+                },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        std::move(config));
+
+    // Recorded locally on the owning SubMaster, exactly as PutEnd/Get do; no
+    // report is ever sent, so the tick is the only possible wakeup.
+    rt->RecordAccess("local-key",
+                     AccessRecord{.object = {TenantId("tenant"), "local-key"},
+                                  .observed_at_ns = 1,
+                                  .block_size = 4096,
+                                  .tier = CacheTier::kL1Host,
+                                  .operation = IoOperation::kGet,
+                                  .is_hit = true});
+
+    std::unique_lock lock(observer_mutex);
+    ASSERT_TRUE(observer_condition.wait_for(lock, std::chrono::seconds(10), [&] {
+        return last_report.has_value();
+    })) << "the periodic tick never ran a cycle";
+    ASSERT_TRUE(last_report.has_value());
+    EXPECT_TRUE(last_report->tier_down);
+    EXPECT_EQ(last_report->eviction_target_bytes, 64ULL * 1024 * 1024);
+
+    std::lock_guard plan_lock(plan_mutex);
+    ASSERT_TRUE(handled_plan.has_value());
+    EXPECT_EQ(handled_plan->tier_down_target_bytes, 64ULL * 1024 * 1024);
+    for (const auto& candidate : handled_plan->candidates) {
+        EXPECT_EQ(candidate.action, EvictionAction::kTierDown);
+    }
+}
+
+// A tick cycle must not reclaim: the master's watermark thread owns pressure, and
+// the ratio it records stays in the collector until the next breach, so honouring
+// it here would reclaim the same excess twice.
+TEST(IoPatternFrameworkTest, ReportDrivenTickIgnoresRecordedPressure) {
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    std::optional<IoPatternRuntime::ReportDrivenCycleReport> last_report;
+    std::mutex plan_mutex;
+    std::optional<EvictionPlan> handled_plan;
+    IoPatternRuntime::Config config;
+    config.report_driven_execution = true;
+    config.tier_down_bytes_per_cycle = 64ULL * 1024 * 1024;
+    config.tick_interval_ms = 50;
+    config.analysis_timeout_us = 30'000'000;
+    config.report_driven_observer =
+        [&](const IoPatternRuntime::ReportDrivenCycleReport& report) {
+            std::lock_guard lock(observer_mutex);
+            last_report = report;
+            observer_condition.notify_all();
+        };
+    auto rt = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction =
+                [&](const EvictionPlan& plan) {
+                    std::lock_guard lock(plan_mutex);
+                    handled_plan = plan;
+                    return ErrorCode::OK;
+                },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        std::move(config));
+
+    rt->RecordAccess("local-key",
+                     AccessRecord{.object = {TenantId("tenant"), "local-key"},
+                                  .observed_at_ns = 1,
+                                  .block_size = 4096,
+                                  .tier = CacheTier::kL1Host,
+                                  .operation = IoOperation::kGet,
+                                  .is_hit = true});
+    // Host memory far above the high watermark: a report-triggered cycle would
+    // derive a reclaim request from this, a tick-triggered one must not.
+    rt->RecordStorageMetric(StorageMetric{.source_id = "master-memory",
+                                          .observed_at_ns = 1,
+                                          .tier = CacheTier::kL1Host,
+                                          .used_bytes = 1024ULL * 1024 * 1024,
+                                          .capacity_bytes =
+                                              1024ULL * 1024 * 1024,
+                                          .memory_used_ratio = 0.95F});
+
+    std::unique_lock lock(observer_mutex);
+    ASSERT_TRUE(observer_condition.wait_for(lock, std::chrono::seconds(10), [&] {
+        return last_report.has_value();
+    }));
+    ASSERT_TRUE(last_report.has_value());
+    EXPECT_TRUE(last_report->tier_down);
+    EXPECT_FALSE(last_report->cold_eviction);
+    EXPECT_EQ(last_report->eviction_target_bytes, 64ULL * 1024 * 1024);
+
+    std::lock_guard plan_lock(plan_mutex);
+    ASSERT_TRUE(handled_plan.has_value());
+    EXPECT_EQ(handled_plan->tier_down_target_bytes, 64ULL * 1024 * 1024);
+    ASSERT_FALSE(handled_plan->candidates.empty());
+    for (const auto& candidate : handled_plan->candidates) {
+        EXPECT_EQ(candidate.action, EvictionAction::kTierDown);
+    }
+}
+
+// The tick is gated on a below-watermark driver being configured, so a cluster
+// that only uses the watermark path pays no periodic analysis (and gets no
+// surprise cycles while idle).
+TEST(IoPatternFrameworkTest, ReportDrivenTickIsOffWithoutABelowWatermarkDriver) {
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    bool observed = false;
+    IoPatternRuntime::Config config;
+    config.report_driven_execution = true;
+    config.tick_interval_ms = 50;
+    config.report_driven_observer =
+        [&](const IoPatternRuntime::ReportDrivenCycleReport&) {
+            std::lock_guard lock(observer_mutex);
+            observed = true;
+            observer_condition.notify_all();
+        };
+    auto rt = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{
+            .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
+            .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
+            .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
+        std::move(config));
+
+    std::unique_lock lock(observer_mutex);
+    EXPECT_FALSE(observer_condition.wait_for(lock, std::chrono::milliseconds(500),
+                                             [&] { return observed; }))
+        << "no driver is configured, so nothing should be running cycles";
+}
+
 TEST(IoPatternFrameworkTest, ReporterBackgroundLifecycleFlushesOnStop) {
     size_t batches = 0;
     IoPatternReporter reporter(4, [&](const MetricBatch&) {

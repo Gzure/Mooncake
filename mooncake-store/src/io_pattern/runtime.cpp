@@ -336,18 +336,42 @@ void IoPatternRuntime::WaitForReportDrivenIdle() {
 }
 
 void IoPatternRuntime::ReportDrivenWorker() {
+    // Below-watermark drivers (tier down, cold eviction) must not depend on client
+    // reports: reports only flow while there is traffic, so an idle cluster would
+    // never pave cold data down or reclaim it. When either driver is configured
+    // the worker wakes on a timer as well; clusters that configure neither pay no
+    // periodic analysis, and a tick can never fire with a zero interval.
+    const bool tick_enabled = config_.report_driven_execution &&
+                              config_.tick_interval_ms != 0 &&
+                              (config_.tier_down_bytes_per_cycle != 0 ||
+                               config_.report_driven_cold_eviction);
+    const auto tick_interval =
+        std::chrono::milliseconds(static_cast<int64_t>(config_.tick_interval_ms));
     while (true) {
+        bool tick_triggered = false;
         {
             std::unique_lock lock(report_mutex_);
-            report_condition_.wait(lock, [this] {
-                return report_stopping_ || report_pending_;
-            });
+            if (tick_enabled) {
+                if (!report_condition_.wait_for(lock, tick_interval, [this] {
+                        return report_stopping_ || report_pending_;
+                    })) {
+                    tick_triggered = true;
+                }
+            } else {
+                report_condition_.wait(lock, [this] {
+                    return report_stopping_ || report_pending_;
+                });
+            }
             if (report_stopping_) return;
             report_pending_ = false;
             report_worker_busy_ = true;
         }
         try {
-            RunReportDrivenCycle();
+            // A tick cycle ignores any recorded storage pressure on purpose: the
+            // master's own watermark thread owns pressure reclaims, and the ratio
+            // it records lingers in the collector until the next breach, so
+            // honouring it here would reclaim the same excess a second time.
+            RunReportDrivenCycle(/*allow_pressure=*/!tick_triggered);
         } catch (...) {
             policy_->RecordFailure();
             observability_.RecordDegrade();
@@ -470,7 +494,7 @@ std::vector<ObjectRef> IoPatternRuntime::DeriveAdmissionCandidates(
     return candidates;
 }
 
-void IoPatternRuntime::RunReportDrivenCycle() {
+void IoPatternRuntime::RunReportDrivenCycle(bool allow_pressure) {
     IoPatternSnapshot snapshot = collector_->GetSnapshot();
     ReportDrivenCycleReport report;
     report.cycle_id = ++report_cycle_id_;
@@ -483,9 +507,14 @@ void IoPatternRuntime::RunReportDrivenCycle() {
     }
     CacheTier eviction_tier = CacheTier::kL1Host;
     uint64_t eviction_bytes = 0;
-    DeriveEvictionRequest(snapshot, config_.report_eviction_high_ratio,
-                          config_.report_eviction_target_ratio, eviction_tier,
-                          eviction_bytes);
+    // A tick-driven cycle skips the pressure request entirely, so the
+    // below-watermark drivers below decide (tier down, then cold eviction). The
+    // master's watermark thread already handled any real breach.
+    if (allow_pressure) {
+        DeriveEvictionRequest(snapshot, config_.report_eviction_high_ratio,
+                              config_.report_eviction_target_ratio,
+                              eviction_tier, eviction_bytes);
+    }
     // Tier-down driver: the below-watermark placement action. Copy the coldest
     // in-memory keys down to LOCAL_DISK while keeping their MEMORY replica, so a
     // later reclaim of those keys can discard them safely instead of copying then.
