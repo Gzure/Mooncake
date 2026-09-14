@@ -25,32 +25,32 @@
 // Remote policy execution is only observable when the SubMaster actually owns
 // the reported keys: its eviction/promotion/prefetch handlers operate on real
 // replicas, so a report-only run leaves the master-side counters at zero. When
-// --master_server and --num_keys are provided, a real-data seeding stage runs
+//--master_server and --num_keys are provided, a real-data seeding stage runs
 // first ("先种子后仿真"): it writes a batch of real KV objects through
 // RealClient (keys share the simulated KvKey naming and tenant) and reads a
 // subset back to simulate access heat, then the simulated vLLM request stream
 // reports on those same keys.
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
-#include
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <optional>
+#include <set>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 #include <numa.h>
 #include "gflags/gflags.h"
 #include "glog/logging.h"
@@ -110,7 +110,7 @@ DEFINE_string(cfm_cluster_namespace, "",
 DEFINE_string(master_server, "",
               "Master server address (host:port) for RealClient writes; empty "
               "disables real-data seeding");
-DEFINE_string(local_hostname, "localhost",
+DEFINE_string(local_hostname, "[localhost](https://localhost)",
               "Local hostname (with optional port, e.g. node1:12345)");
 DEFINE_string(
     metadata_server,
@@ -233,16 +233,17 @@ DEFINE_int32(prefetch_ready_poll_sec, 120,
              "holds the keys' leases so eviction cannot delete them. 0 "
              "disables the poll.");
 uint64_t SteadyNowNs() {
-    return static_cast(std::chrono::duration_caststd::chrono::nanoseconds(
-                           Clock::now().time_since_epoch())
-                           .count());
+    return static_cast<uint64_t>(
+        std::chrono::duration_caststd::chrono::nanoseconds(
+            Clock::now().time_since_epoch())
+            .count());
 }
 double ToMicroseconds(Clock::duration duration) {
     return std::chrono::duration<double, std::micro>(duration).count();
 }
 size_t BlockCount(uint64_t tokens) {
-    return static_cast((tokens + FLAGS_tokens_per_block - 1) /
-                       FLAGS_tokens_per_block);
+    return static_cast<size_t>((tokens + FLAGS_tokens_per_block - 1) /
+                               FLAGS_tokens_per_block);
 }
 std::string KvKey(size_t session, size_t request, size_t layer, size_t block,
                   bool is_shared_prefix) {
@@ -278,7 +279,7 @@ std::string SessionWorkloadType(size_t session) {
 // benchmark run, exercised without network.
 class EmbeddedCfmTransport final : public CfmRpcTransport {
    public:
-    explicit EmbeddedCfmTransport(std::shared_ptr service)
+    explicit EmbeddedCfmTransport(std::shared_ptr<CfmService> service)
         : service_(std::move(service)) {}
     bool Send(std::string_view method, std::string_view payload,
               std::chrono::milliseconds) override {
@@ -286,7 +287,7 @@ class EmbeddedCfmTransport final : public CfmRpcTransport {
     }
 
    private:
-    std::shared_ptr service_;
+    std::shared_ptr<CfmService> service_;
 };
 #ifdef STORE_USE_ETCD
 // Resolves the CVM cluster namespace used by --cfm_endpoint when it carries an
@@ -316,7 +317,7 @@ std::string BuildMasterViewKey(const std::string& cluster_namespace) {
 // returns an ownership resolver that routes every key to it. If it is an
 // etcd:// entry, it resolves the cluster like a Store client: a present
 // leader master_view yields a single target; otherwise the CVM
-// /cvm//masters registry plus slot ownership is used to bucket keys to
+// /cvm/<ns>/masters registry plus slot ownership is used to bucket keys to
 // their owning SubMaster. Returns an empty resolver on any resolution failure
 // (the caller aborts instead of hanging).
 SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
@@ -384,7 +385,8 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
     std::map<std::string, std::string> address_by_master;  // id -> host:port
     std::vectorstd::string primary_ids;
     for (const auto& reg : masters) {
-        if (reg.role == static_cast(mooncake::cvm::MasterRole::kPrimary) &&
+        if (reg.role ==
+                static_cast<int32_t>(mooncake::cvm::MasterRole::kPrimary) &&
             !reg.address.empty()) {
             address_by_master[reg.master_id] = reg.address;
             primary_ids.push_back(reg.master_id);
@@ -405,7 +407,8 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
         cluster_namespace, slot_owners, version);
     if (slot_err == ErrorCode::OK) {
         for (const auto& owner : slot_owners) {
-            if (owner.state == static_cast(mooncake::cvm::SlotState::kStable) &&
+            if (owner.state ==
+                    static_cast<int32_t>(mooncake::cvm::SlotState::kStable) &&
                 !owner.primary_master_id.empty()) {
                 owner_by_slot[owner.slot] = owner.primary_master_id;
             }
@@ -442,7 +445,7 @@ class LatencyStats final {
     double Percentile(double percentile) const {
         if (values_us_.empty()) return 0.0;
         const double rank = percentile / 100.0 * (values_us_.size() - 1);
-        const auto lower = static_cast(rank);
+        const auto lower = static_cast<size_t>(rank);
         const auto upper = std::min(lower + 1, values_us_.size() - 1);
         const double fraction = rank - lower;
         return values_us_[lower] * (1.0 - fraction) +
@@ -456,7 +459,7 @@ class LatencyStats final {
     }
 
    private:
-    std::vector values_us_;
+    std::vector<double> values_us_;
 };
 struct MetricReportSnapshot {
     uint64_t calls{0};
@@ -492,8 +495,8 @@ class MetricReportStats final {
 };
 struct RequestData {
     IoPatternSnapshot snapshot;
-    std::vector inference;
-    std::vector accesses;
+    std::vector<InferenceMetrics> inference;
+    std::vector<AccessRecord> accesses;
 };
 RequestData BuildRequest(size_t request_index) {
     const size_t session = request_index % FLAGS_num_sessions;
@@ -518,23 +521,26 @@ RequestData BuildRequest(size_t request_index) {
             const ObjectRef object{.tenant_id = tenant,
                                    .key = KvKey(session, request_index, layer,
                                                 block, is_shared_prefix)};
-            const auto block_end =
-                std::min(total_tokens, (block + 1) * FLAGS_tokens_per_block);
-            const auto block_tokens =
-                static_cast(block_end - block * FLAGS_tokens_per_block);
+            const auto block_end = std::min<uint64_t>(
+                total_tokens, (block + 1) * FLAGS_tokens_per_block);
+            const auto block_tokens = static_cast<uint32_t>(
+                block_end - block * FLAGS_tokens_per_block);
             InferenceMetrics inference{
                 .object = object,
                 .session_id = session_id,
                 .layout = CacheLayout::kLayerFirst,
-                .layout_group = static_cast(layer),
-                .prefix_depth = static_cast(shared_blocks),
-                .prefix_fanout = static_cast(FLAGS_num_sessions),
+                .layout_group = static_cast<uint32_t>(layer),
+                .prefix_depth = static_cast<uint32_t>(shared_blocks),
+                .prefix_fanout = static_cast<uint32_t>(FLAGS_num_sessions),
                 .match_length =
-                    is_hit ? static_cast(FLAGS_shared_prefix_tokens) : 0U,
+                    is_hit ? static_cast<uint32_t>(FLAGS_shared_prefix_tokens)
+                           : 0U,
                 .continuous_prefix_length =
-                    is_hit ? static_cast(FLAGS_shared_prefix_tokens) : 0U,
+                    is_hit ? static_cast<uint32_t>(FLAGS_shared_prefix_tokens)
+                           : 0U,
                 .token_count = block_tokens,
-                .recompute_cost = is_hit ? 0.0F : static_cast(block_tokens),
+                .recompute_cost =
+                    is_hit ? 0.0F : static_cast<float>(block_tokens),
                 .request_priority = 1};
             AccessRecord access{
                 .object = object,
@@ -544,7 +550,8 @@ RequestData BuildRequest(size_t request_index) {
                 .tier = CacheTier::kL1Host,
                 .operation = is_hit ? IoOperation::kGet : IoOperation::kPut,
                 .is_hit = is_hit,
-                .write_batch_size = is_hit ? 0U : static_cast(FLAGS_num_layers),
+                .write_batch_size =
+                    is_hit ? 0U : static_cast<uint32_t>(FLAGS_num_layers),
                 .overwrite = !is_hit && is_shared_prefix};
             // Override reported metrics for S4 workload type testing
             if (!workload_type.empty()) {
@@ -571,8 +578,8 @@ RequestData BuildRequest(size_t request_index) {
                 .access_count_window = 3,
                 .block_size = FLAGS_kv_block_bytes,
                 .token_count = block_tokens,
-                .prefix_depth = static_cast(shared_blocks),
-                .prefix_fanout = static_cast(FLAGS_num_sessions),
+                .prefix_depth = static_cast<uint32_t>(shared_blocks),
+                .prefix_fanout = static_cast<uint32_t>(FLAGS_num_sessions),
                 .match_length = inference.match_length,
                 .continuous_prefix_length = inference.continuous_prefix_length,
                 .write_batch_size = access.write_batch_size,
@@ -583,7 +590,7 @@ RequestData BuildRequest(size_t request_index) {
                 .overwrite_ratio = access.overwrite ? 1.0F : 0.0F,
                 .replica_tiers = CacheTierBit(CacheTier::kL1Host),
                 .layout = CacheLayout::kLayerFirst,
-                .layout_group = static_cast(layer),
+                .layout_group = static_cast<uint32_t>(layer),
                 .request_priority = 1,
                 .active = is_hit,
                 .write_burst = !is_hit};
@@ -612,10 +619,11 @@ RequestData BuildRequest(size_t request_index) {
         .write_bandwidth_bytes_per_sec = 10ULL * 1024 * 1024 * 1024,
         .read_latency_us = 20,
         .write_latency_us = 200,
-        .used_bytes = static_cast(FLAGS_memory_used_ratio * 1024 * 1024 * 1024),
+        .used_bytes =
+            static_cast<uint64_t>(FLAGS_memory_used_ratio * 1024 * 1024 * 1024),
         .capacity_bytes = 1024ULL * 1024 * 1024,
         .rpc_latency_us = 100,
-        .memory_used_ratio = static_cast(FLAGS_memory_used_ratio)});
+        .memory_used_ratio = static_cast<float>(FLAGS_memory_used_ratio)});
     return request;
 }
 void PrintObservability(std::string_view name,
@@ -664,7 +672,7 @@ struct SeedStats {
 struct SeedOutcome {
     SeedStats stats;
     std::vectorstd::string keys;  // real keys written, stable order
-    std::vector hot;              // parallel: read back (access heat)
+    std::vector<bool> hot;        // parallel: read back (access heat)
 };
 SeedOutcome RunRealSeedStage() {
     SeedOutcome outcome;
@@ -678,7 +686,7 @@ SeedOutcome RunRealSeedStage() {
               << " replica_num=" << FLAGS_replica_num
               << " offload=" << (FLAGS_enable_ssd_offload ? "yes" : "no");
     auto client = mooncake::RealClient::create();
-    const size_t block_bytes = std::max(FLAGS_value_size, 4096);
+    const size_t block_bytes = std::max<size_t>(FLAGS_value_size, 4096);
     char* buffer = reinterpret_cast<char*>(numa_alloc_local(block_bytes));
     if (buffer == nullptr) {
         LOG(ERROR) << "numa_alloc_local failed for seed buffer of "
@@ -709,7 +717,7 @@ SeedOutcome RunRealSeedStage() {
     // reported key universe (real replicas exist for the keys policy will
     // select).
     mooncake::ReplicateConfig config;
-    config.replica_num = static_cast(FLAGS_replica_num);
+    config.replica_num = static_cast<size_t>(FLAGS_replica_num);
     config.with_hard_pin = FLAGS_hard_pin;
     const uint64_t total_tokens = FLAGS_prompt_tokens + FLAGS_output_tokens;
     const size_t blocks = BlockCount(total_tokens);
@@ -745,9 +753,10 @@ SeedOutcome RunRealSeedStage() {
     // SubMaster records real GET access heat (promotion-on-hit when offloaded).
     // Mark the same prefix of the written key list as hot for the report pass.
     outcome.hot.assign(outcome.keys.size(), false);
-    const uint64_t read_count = FLAGS_seed_get_keys == 0
-                                    ? seeded / 2
-                                    : std::min(FLAGS_seed_get_keys, seeded);
+    const uint64_t read_count =
+        FLAGS_seed_get_keys == 0
+            ? seeded / 2
+            : std::min<uint64_t>(FLAGS_seed_get_keys, seeded);
     uint64_t read_keys = 0;
     for (size_t request_index = 0;
          request_index < FLAGS_requests && read_keys < read_count;
@@ -799,15 +808,15 @@ int main(int argc, char* argv[]) {
                       "--memory_used_ratio must be within [0, 1]";
         return 1;
     }
-    std::atomic eviction_commands{0};
-    std::atomic prefetch_commands{0};
-    std::atomic admission_commands{0};
+    std::atomic<uint64_t> eviction_commands{0};
+    std::atomic<uint64_t> prefetch_commands{0};
+    std::atomic<uint64_t> admission_commands{0};
     // The SubMaster-side CFM component (embedded mode) or the ownership
     // resolver used by the remote reporter.
-    std::shared_ptr embedded_service;
-    std::shared_ptr cfm_runtime;
-    std::shared_ptr ownership_client;
-    std::shared_ptr embedded_channel;
+    std::shared_ptr<CfmService> embedded_service;
+    std::shared_ptr<IoPatternRuntime> cfm_runtime;
+    std::shared_ptr<CfmOwnershipClient> ownership_client;
+    std::shared_ptr<CfmRpcChannel> embedded_channel;
     std::string deployment_description;
     if (FLAGS_cfm_endpoint.empty()) {
         deployment_description = "embedded SubMaster (local CFM)";
@@ -818,7 +827,7 @@ int main(int argc, char* argv[]) {
         // watermark evaluation at the end of the run.
         cfm_config.report_driven_execution = true;
         cfm_config.max_analysis_keys = FLAGS_max_analysis_keys;
-        cfm_runtime = std::make_shared(
+        cfm_runtime = std::make_shared<IoPatternRuntime>(
             IoPatternRuntime::Handlers{
                 .eviction =
                     [&eviction_commands](const EvictionPlan&) {
@@ -836,21 +845,22 @@ int main(int argc, char* argv[]) {
                         return ErrorCode::OK;
                     }},
             std::move(cfm_config));
-        embedded_service = std::make_shared(cfm_runtime);
-        auto transport = std::make_shared(embedded_service);
-        embedded_channel =
-            std::make_shared(std::move(transport), std::make_shared(),
-                             CfmRpcConfig{.timeout = std::chrono::milliseconds(
-                                              FLAGS_cfm_rpc_timeout_ms)});
+        embedded_service = std::make_shared<CfmService>(cfm_runtime);
+        auto transport =
+            std::make_shared<EmbeddedCfmTransport>(embedded_service);
+        embedded_channel = std::make_shared<CfmRpcChannel>(
+            std::move(transport), std::make_shared<CfmBinaryCodec>(),
+            CfmRpcConfig{.timeout = std::chrono::milliseconds(
+                             FLAGS_cfm_rpc_timeout_ms)});
     } else {
         const auto resolver = ResolveCfmEndpointOwnership();
-        ownership_client = std::make_shared(
+        ownership_client = std::make_shared<CfmOwnershipClient>(
             resolver, std::chrono::milliseconds(FLAGS_cfm_rpc_timeout_ms));
         ownership_client->set_forward_storage(FLAGS_report_forward_storage);
-        deployment_description = "remote SubMaster(s) via CFM coro_rpc";
+        deployment_description = "remote SubMaster (s) via CFM coro_rpc";
     }
-    // Real-data seeding runs before the simulated request stream ("先种子后仿
-    // 真"): the SubMaster must hold real replicas for reported keys before the
+    // Real-data seeding runs before the simulated request stream (" 先种子后仿
+    // 真 "): the SubMaster must hold real replicas for reported keys before the
     // report-driven policy cycle can execute eviction/promotion/prefetch
     // against them. Only meaningful with a real SubMaster endpoint
     // (--cfm_endpoint) plus RealClient parameters; otherwise it is a no-op.
@@ -873,7 +883,7 @@ int main(int argc, char* argv[]) {
         return success;
     };
     source_config.report_sink = report_metric_batch;
-    auto source_runtime = std::make_shared(
+    auto source_runtime = std::make_shared<IoPatternRuntime>(
         IoPatternRuntime::Handlers{
             .eviction = [](const EvictionPlan&) { return ErrorCode::OK; },
             .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
@@ -951,11 +961,13 @@ int main(int argc, char* argv[]) {
             .write_bandwidth_bytes_per_sec = 10ULL * 1024 * 1024 * 1024,
             .read_latency_us = 20,
             .write_latency_us = 200,
-            .used_bytes = static_cast(static_cast(FLAGS_value_size) *
+            .used_bytes =
+                static_cast<uint64_t>(static_cast<double>(FLAGS_value_size) *
                                       seed_outcome.keys.size()),
-            .capacity_bytes = static_cast(FLAGS_num_keys) * FLAGS_value_size,
+            .capacity_bytes =
+                static_cast<uint64_t>(FLAGS_num_keys) * FLAGS_value_size,
             .rpc_latency_us = 100,
-            .memory_used_ratio = static_cast(FLAGS_memory_used_ratio)});
+            .memory_used_ratio = static_cast<float>(FLAGS_memory_used_ratio)});
         const auto report_start = Clock::now();
         const bool sent = send_snapshot(real_snapshot);
         report_latency.Record(ToMicroseconds(Clock::now() - report_start));
@@ -1161,24 +1173,24 @@ int main(int argc, char* argv[]) {
                 snapshot.generated_at_ns = now_ns + rep;
                 snapshot.keys.reserve(prefetch_keys.size());
                 for (size_t i = 0; i < prefetch_keys.size(); ++i) {
-                    snapshot.keys.push_back(
-                        KeyMetrics{.object = {.tenant_id = tenant,
-                                              .key = prefetch_keys[i]},
-                                   .session_id = "prefetch-test",
-                                   .last_access_time_ns = now_ns,
-                                   .access_count_window = 3U,
-                                   .block_size = 512U * 1024U,
-                                   .token_count = 16385U,
-                                   .prefix_depth = 0,
-                                   .prefix_fanout = 32U,
-                                   .match_length =
-                                       static_cast(FLAGS_prefetch_match_length),
-                                   .continuous_prefix_length =
-                                       static_cast(FLAGS_prefetch_match_length),
-                                   .recompute_cost = 0.0F,
-                                   .replica_tiers = tiers,
-                                   .request_priority = 1,
-                                   .active = true});
+                    snapshot.keys.push_back(KeyMetrics{
+                        .object = {.tenant_id = tenant,
+                                   .key = prefetch_keys[i]},
+                        .session_id = "prefetch-test",
+                        .last_access_time_ns = now_ns,
+                        .access_count_window = 3U,
+                        .block_size = 512U * 1024U,
+                        .token_count = 16385U,
+                        .prefix_depth = 0,
+                        .prefix_fanout = 32U,
+                        .match_length =
+                            static_cast<uint32_t>(FLAGS_prefetch_match_length),
+                        .continuous_prefix_length =
+                            static_cast<uint32_t>(FLAGS_prefetch_match_length),
+                        .recompute_cost = 0.0F,
+                        .replica_tiers = tiers,
+                        .request_priority = 1,
+                        .active = true});
                 }
                 snapshot.storage.push_back(
                     StorageMetric{.source_id = FLAGS_node_id,
@@ -1196,7 +1208,7 @@ int main(int argc, char* argv[]) {
         }
         LOG(INFO) << "[PROMO-TEST] wait done, re-reading seeded keys...";
         auto client = mooncake::RealClient::create();
-        const size_t block_bytes = std::max(FLAGS_value_size, 4096);
+        const size_t block_bytes = std::max<size_t>(FLAGS_value_size, 4096);
         char* buffer = reinterpret_cast<char*>(numa_alloc_local(block_bytes));
         if (buffer) {
             std::memset(buffer, 0xA5, block_bytes);
@@ -1310,9 +1322,10 @@ int main(int argc, char* argv[]) {
                     .token_count = 16385U,
                     .prefix_depth = 0,
                     .prefix_fanout = 32U,
-                    .match_length = static_cast(FLAGS_prefetch_match_length),
+                    .match_length =
+                        static_cast<uint32_t>(FLAGS_prefetch_match_length),
                     .continuous_prefix_length =
-                        static_cast(FLAGS_prefetch_match_length),
+                        static_cast<uint32_t>(FLAGS_prefetch_match_length),
                     .recompute_cost = 0.0F,
                     .replica_tiers = CacheTierBit(CacheTier::kLocalDisk),
                     .request_priority = 1,
@@ -1331,7 +1344,7 @@ int main(int argc, char* argv[]) {
         }
     }
     const auto submission_seconds =
-        std::chrono::duration(Clock::now() - benchmark_start).count();
+        std::chrono::duration<double>(Clock::now() - benchmark_start).count();
     // Stop joins the reporter worker and performs its final flush. No new
     // metric batch can reach the SubMaster after this returns.
     source_runtime->StopReports();
@@ -1352,8 +1365,8 @@ int main(int argc, char* argv[]) {
     if (cfm_runtime && !cfm_runtime->report_driven_execution() &&
         !cfm_runtime->Snapshot().keys.empty()) {
         const auto capacity = 1024ULL * 1024 * 1024;
-        const auto target = static_cast((FLAGS_memory_used_ratio - 0.80F) *
-                                        static_cast(capacity));
+        const auto target = static_cast<uint64_t>(
+            (FLAGS_memory_used_ratio - 0.80F) * static_cast<float>(capacity));
         const auto status = cfm_runtime->Execute(
             CacheTier::kL1Host, target > 0 ? target : capacity / 10,
             TraceHistory{});
@@ -1363,7 +1376,7 @@ int main(int argc, char* argv[]) {
         }
     }
     const auto end_to_end_seconds =
-        std::chrono::duration(Clock::now() - benchmark_start).count();
+        std::chrono::duration<double>(Clock::now() - benchmark_start).count();
     const auto source_snapshot = source_runtime->Snapshot();
     const auto source_metrics =
         source_runtime->ObservabilitySnapshot(end_to_end_seconds);
