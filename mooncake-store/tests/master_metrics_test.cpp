@@ -921,6 +921,9 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     const int64_t base_file_cache_nums = metrics.get_file_cache_nums();
 
     // Step 1: Mount segment and create a completed MEMORY replica.
+    // MountSegment registers the owner in client_host_id_ only with a host ID.
+    // LOCAL_DISK reads filter out replicas whose owner is not registered.
+    segment.host_id = "ssd-metrics-host";
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     auto put_start_result =
@@ -1025,6 +1028,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
 TEST_F(MasterMetricsTest, AdminMetricsExposeIoPatternFeedbackFromAccesses) {
     const int http_port = getFreeTcpPort();
     WrappedMasterServiceConfig config;
+    config.default_kv_lease_ttl = 100;
     config.enable_metric_reporting = false;
     WrappedMasterService service(config);
     MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
