@@ -25,11 +25,12 @@
 // Remote policy execution is only observable when the SubMaster actually owns
 // the reported keys: its eviction/promotion/prefetch handlers operate on real
 // replicas, so a report-only run leaves the master-side counters at zero. When
-//--master_server and --num_keys are provided, a real-data seeding stage runs
+// --master_server and --num_keys are provided, a real-data seeding stage runs
 // first ("先种子后仿真"): it writes a batch of real KV objects through
 // RealClient (keys share the simulated KvKey naming and tenant) and reads a
 // subset back to simulate access heat, then the simulated vLLM request stream
 // reports on those same keys.
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -52,6 +53,7 @@
 #include <utility>
 #include <vector>
 #include <numa.h>
+
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 #include "cvm/cvm_types.h"
@@ -67,12 +69,15 @@
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #endif
+
 namespace {
+
 using Clock = std::chrono::steady_clock;
 using mooncake::ErrorCode;
 using mooncake::TenantId;
 using mooncake::toString;
 using namespace mooncake::io_pattern;
+
 DEFINE_uint64(requests, 20, "Number of vLLM-style inference requests");
 DEFINE_uint64(prompt_tokens, 1024, "Input tokens in each inference request");
 DEFINE_uint64(output_tokens, 128, "Decode tokens in each inference request");
@@ -101,6 +106,7 @@ DEFINE_string(cfm_cluster_namespace, "",
               "MC_STORE_CLUSTER_ID or mooncake_cluster (same rule as the "
               "etcd leader coordinator). When the cluster was started with a "
               "non-default cluster_id, pass the same value here");
+
 // Real Store client parameters used by the optional real-data seeding stage.
 // Flag names and defaults mirror stress_cluster_bench.cpp so an existing
 // cluster invocation can be reused as-is. Seeding makes the SubMaster hold
@@ -110,12 +116,10 @@ DEFINE_string(cfm_cluster_namespace, "",
 DEFINE_string(master_server, "",
               "Master server address (host:port) for RealClient writes; empty "
               "disables real-data seeding");
-DEFINE_string(local_hostname, "[localhost](https://localhost)",
+DEFINE_string(local_hostname, "localhost",
               "Local hostname (with optional port, e.g. node1:12345)");
-DEFINE_string(
-    metadata_server,
-    "[http://127.0.0.1:8080/metadata](http://127.0.0.1:8080/metadata)",
-    "Metadata server URL for RealClient setup");
+DEFINE_string(metadata_server, "http://127.0.0.1:8080/metadata",
+              "Metadata server URL for RealClient setup");
 DEFINE_string(protocol, "tcp", "Transport protocol: tcp, rdma, ub");
 DEFINE_string(device_name, "", "RDMA/UB device name (comma-separated)");
 DEFINE_uint64(global_segment_size, 16ULL * 1024 * 1024 * 1024,
@@ -144,7 +148,7 @@ DEFINE_uint64(cfm_rpc_timeout_ms, 5000,
               "report_metric_batch) in milliseconds");
 // Client-side collector/analysis key budget. The default 100k cap drops
 // observations once the simulated request stream exceeds it (seen as nonzero
-// "report drops"); raise it to cover the whole run when reporting many keys.
+// \"report drops\"); raise it to cover the whole run when reporting many keys.
 DEFINE_uint64(
     max_analysis_keys, 100000,
     "Max merged keys kept/analyzed by the client runtime and the "
@@ -232,19 +236,23 @@ DEFINE_int32(prefetch_ready_poll_sec, 120,
              "whole plan. Polling get_replica_desc both confirms readiness and "
              "holds the keys' leases so eviction cannot delete them. 0 "
              "disables the poll.");
+
 uint64_t SteadyNowNs() {
     return static_cast<uint64_t>(
-        std::chrono::duration_caststd::chrono::nanoseconds(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
             Clock::now().time_since_epoch())
             .count());
 }
+
 double ToMicroseconds(Clock::duration duration) {
     return std::chrono::duration<double, std::micro>(duration).count();
 }
+
 size_t BlockCount(uint64_t tokens) {
     return static_cast<size_t>((tokens + FLAGS_tokens_per_block - 1) /
                                FLAGS_tokens_per_block);
 }
+
 std::string KvKey(size_t session, size_t request, size_t layer, size_t block,
                   bool is_shared_prefix) {
     const auto owner = is_shared_prefix
@@ -254,6 +262,7 @@ std::string KvKey(size_t session, size_t request, size_t layer, size_t block,
            "/" + owner + "/layer-" + std::to_string(layer) + "/block-" +
            std::to_string(block);
 }
+
 // Per-session workload type for S4.2: index into the comma-separated
 // --force_session_workload_types list by session id; fall back to the global
 // --force_workload_type when the list is empty or the session is out of range.
@@ -274,6 +283,7 @@ std::string SessionWorkloadType(size_t session) {
     }
     return FLAGS_force_workload_type;
 }
+
 // Sends reports straight into an embedded SubMaster's CFM component. This is
 // the ownership-addressed path collapsed to the single owning SubMaster of a
 // benchmark run, exercised without network.
@@ -281,6 +291,7 @@ class EmbeddedCfmTransport final : public CfmRpcTransport {
    public:
     explicit EmbeddedCfmTransport(std::shared_ptr<CfmService> service)
         : service_(std::move(service)) {}
+
     bool Send(std::string_view method, std::string_view payload,
               std::chrono::milliseconds) override {
         return service_ && service_->Send(method, payload, FLAGS_node_id);
@@ -289,6 +300,7 @@ class EmbeddedCfmTransport final : public CfmRpcTransport {
    private:
     std::shared_ptr<CfmService> service_;
 };
+
 #ifdef STORE_USE_ETCD
 // Resolves the CVM cluster namespace used by --cfm_endpoint when it carries an
 // etcd:// backend. Mirrors EtcdLeaderCoordinator::ResolveClusterNamespace:
@@ -303,6 +315,7 @@ std::string ResolveCvmNamespace() {
     }
     return mooncake::DEFAULT_CLUSTER_ID;
 }
+
 // Key that stores the leader address for single-leader HA.
 // Mirrors EtcdLeaderCoordinator::BuildMasterViewKey.
 std::string BuildMasterViewKey(const std::string& cluster_namespace) {
@@ -313,6 +326,7 @@ std::string BuildMasterViewKey(const std::string& cluster_namespace) {
     return "mooncake-store/" + normalized + "/master_view";
 }
 #endif  // STORE_USE_ETCD
+
 // If --cfm_endpoint names a single SubMaster directly ("host:port") this
 // returns an ownership resolver that routes every key to it. If it is an
 // etcd:// entry, it resolves the cluster like a Store client: a present
@@ -328,7 +342,7 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
         // SubMaster (the equivalent of the old single-endpoint remote mode).
         const std::string endpoint = entry;
         return [endpoint](const TenantId&,
-                          const std::string&) -> std::optionalstd::string {
+                          const std::string&) -> std::optional<std::string> {
             return endpoint;
         };
     }
@@ -346,12 +360,14 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
     }
     const std::string connstring = entry.substr(scheme_pos + 3);
     const std::string cluster_namespace = ResolveCvmNamespace();
+
     ErrorCode err = mooncake::EtcdHelper::ConnectToEtcdStoreClient(connstring);
     if (err != ErrorCode::OK) {
         LOG(FATAL) << "cfm_endpoint: failed to connect etcd '" << connstring
                    << "': " << toString(err);
         return {};
     }
+
     // Single-leader HA: leader master_view holds the master address.
     const std::string view_key = BuildMasterViewKey(cluster_namespace);
     std::string leader_address;
@@ -363,7 +379,7 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
                   << leader_address;
         const std::string endpoint = std::move(leader_address);
         return [endpoint](const TenantId&,
-                          const std::string&) -> std::optionalstd::string {
+                          const std::string&) -> std::optional<std::string> {
             return endpoint;
         };
     }
@@ -372,8 +388,9 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
                    << toString(err);
         return {};
     }
+
     // CVM multi-submaster: masters registry + slot ownership.
-    std::vectormooncake::cvm::MasterRegistration masters;
+    std::vector<mooncake::cvm::MasterRegistration> masters;
     mooncake::ViewVersionId version = 0;
     err = mooncake::cvm::EtcdViewStore::LoadAllMasters(cluster_namespace,
                                                        masters, version);
@@ -382,8 +399,9 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
                    << cluster_namespace << "': " << toString(err);
         return {};
     }
+
     std::map<std::string, std::string> address_by_master;  // id -> host:port
-    std::vectorstd::string primary_ids;
+    std::vector<std::string> primary_ids;
     for (const auto& reg : masters) {
         if (reg.role ==
                 static_cast<int32_t>(mooncake::cvm::MasterRole::kPrimary) &&
@@ -399,10 +417,11 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
         return {};
     }
     std::sort(primary_ids.begin(), primary_ids.end());
+
     // Prefer the authoritative slot owner table published by CvmController;
     // fall back to the consistent-hash ring used by the masters themselves.
     std::unordered_map<uint16_t, std::string> owner_by_slot;
-    std::vectormooncake::cvm::SlotOwner slot_owners;
+    std::vector<mooncake::cvm::SlotOwner> slot_owners;
     const ErrorCode slot_err = mooncake::cvm::EtcdViewStore::LoadAllSlotOwners(
         cluster_namespace, slot_owners, version);
     if (slot_err == ErrorCode::OK) {
@@ -419,11 +438,12 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
               << "' has " << primary_ids.size() << " primary submaster(s), "
               << (has_owner_table ? owner_by_slot.size() : 0) << " slot owners"
               << (has_owner_table ? "" : " (falling back to hash ring)");
+
     return [address_by_master = std::move(address_by_master),
             primary_ids = std::move(primary_ids),
             owner_by_slot = std::move(owner_by_slot), has_owner_table](
                const TenantId& tenant,
-               const std::string& key) -> std::optionalstd::string {
+               const std::string& key) -> std::optional<std::string> {
         const uint16_t slot = mooncake::cvm::KeySlot(tenant, key);
         std::string owner;
         if (has_owner_table) {
@@ -439,9 +459,11 @@ SubmasterEndpointResolver ResolveCfmEndpointOwnership() {
     };
 #endif
 }
+
 class LatencyStats final {
    public:
     void Record(double value_us) { values_us_.push_back(value_us); }
+
     double Percentile(double percentile) const {
         if (values_us_.empty()) return 0.0;
         const double rank = percentile / 100.0 * (values_us_.size() - 1);
@@ -451,7 +473,9 @@ class LatencyStats final {
         return values_us_[lower] * (1.0 - fraction) +
                values_us_[upper] * fraction;
     }
+
     void Finalize() { std::sort(values_us_.begin(), values_us_.end()); }
+
     double Mean() const {
         if (values_us_.empty()) return 0.0;
         return std::accumulate(values_us_.begin(), values_us_.end(), 0.0) /
@@ -461,12 +485,14 @@ class LatencyStats final {
    private:
     std::vector<double> values_us_;
 };
+
 struct MetricReportSnapshot {
     uint64_t calls{0};
     uint64_t failures{0};
     uint64_t observations{0};
     LatencyStats latency;
 };
+
 class MetricReportStats final {
    public:
     void Record(const MetricBatch& batch, double latency_us, bool success) {
@@ -477,6 +503,7 @@ class MetricReportStats final {
                         batch.storage.size();
         latency.Record(latency_us);
     }
+
     MetricReportSnapshot Finalize() {
         std::lock_guard lock(mutex_);
         latency.Finalize();
@@ -493,11 +520,13 @@ class MetricReportStats final {
     uint64_t observations{0};
     LatencyStats latency;
 };
+
 struct RequestData {
     IoPatternSnapshot snapshot;
     std::vector<InferenceMetrics> inference;
     std::vector<AccessRecord> accesses;
 };
+
 RequestData BuildRequest(size_t request_index) {
     const size_t session = request_index % FLAGS_num_sessions;
     const uint64_t total_tokens = FLAGS_prompt_tokens + FLAGS_output_tokens;
@@ -506,6 +535,7 @@ RequestData BuildRequest(size_t request_index) {
         std::min(blocks, BlockCount(FLAGS_shared_prefix_tokens));
     const bool prefix_is_cached = request_index >= FLAGS_num_sessions;
     const uint64_t now_ns = SteadyNowNs();
+
     RequestData request;
     request.snapshot.generated_at_ns = now_ns;
     request.inference.reserve(blocks * FLAGS_num_layers);
@@ -514,6 +544,7 @@ RequestData BuildRequest(size_t request_index) {
     const auto tenant = TenantId(FLAGS_tenant);
     const auto session_id = "vllm-session-" + std::to_string(session);
     const std::string workload_type = SessionWorkloadType(session);
+
     for (size_t layer = 0; layer < FLAGS_num_layers; ++layer) {
         for (size_t block = 0; block < blocks; ++block) {
             const bool is_shared_prefix = block < shared_blocks;
@@ -525,6 +556,7 @@ RequestData BuildRequest(size_t request_index) {
                 total_tokens, (block + 1) * FLAGS_tokens_per_block);
             const auto block_tokens = static_cast<uint32_t>(
                 block_end - block * FLAGS_tokens_per_block);
+
             InferenceMetrics inference{
                 .object = object,
                 .session_id = session_id,
@@ -626,6 +658,7 @@ RequestData BuildRequest(size_t request_index) {
         .memory_used_ratio = static_cast<float>(FLAGS_memory_used_ratio)});
     return request;
 }
+
 void PrintObservability(std::string_view name,
                         const IoPatternObservabilitySnapshot& metrics) {
     std::cout << "\n  " << name << " IO Pattern metrics\n"
@@ -644,6 +677,7 @@ void PrintObservability(std::string_view name,
               << "    report drops:         " << metrics.report_drop_count
               << "\n";
 }
+
 bool ValidateFlags() {
     return FLAGS_requests != 0 &&
            FLAGS_prompt_tokens + FLAGS_output_tokens != 0 &&
@@ -652,6 +686,7 @@ bool ValidateFlags() {
            FLAGS_report_capacity != 0 && FLAGS_memory_used_ratio >= 0.0 &&
            FLAGS_memory_used_ratio <= 1.0;
 }
+
 // Real-data seeding stage (optional). The IO Pattern runtime on the SubMaster
 // only executes storage handlers against replicas that actually exist, so a
 // report-only benchmark leaves master-side eviction/promotion/prefetch counters
@@ -665,15 +700,17 @@ struct SeedStats {
     uint64_t reads{0};
     uint64_t read_failures{0};
 };
+
 // Captures what the seeding stage actually created so the reporting stage can
 // address exactly the real keys (a report stream over synthetic keys whose
 // objects were never stored leaves the SubMaster handlers with nothing to act
 // on, which shows up as OBJECT_NOT_FOUND / zero master-side evictions).
 struct SeedOutcome {
     SeedStats stats;
-    std::vectorstd::string keys;  // real keys written, stable order
-    std::vector<bool> hot;        // parallel: read back (access heat)
+    std::vector<std::string> keys;  // real keys written, stable order
+    std::vector<bool> hot;          // parallel: read back (access heat)
 };
+
 SeedOutcome RunRealSeedStage() {
     SeedOutcome outcome;
     if (FLAGS_master_server.empty() || FLAGS_num_keys == 0 ||
@@ -685,6 +722,7 @@ SeedOutcome RunRealSeedStage() {
               << " value_size=" << FLAGS_value_size
               << " replica_num=" << FLAGS_replica_num
               << " offload=" << (FLAGS_enable_ssd_offload ? "yes" : "no");
+
     auto client = mooncake::RealClient::create();
     const size_t block_bytes = std::max<size_t>(FLAGS_value_size, 4096);
     char* buffer = reinterpret_cast<char*>(numa_alloc_local(block_bytes));
@@ -710,6 +748,7 @@ SeedOutcome RunRealSeedStage() {
         numa_free(buffer, block_bytes);
         return outcome;
     }
+
     // Write keys that share the simulated KvKey naming so later reports and
     // the real metadata address the same objects. Enumerate the same
     // (session, request, layer, block) space as BuildRequest() and stop after
@@ -749,6 +788,7 @@ SeedOutcome RunRealSeedStage() {
         }
     }
     outcome.stats.written = seeded;
+
     // Simulate reads: exercise a hot subset through the real data path so the
     // SubMaster records real GET access heat (promotion-on-hit when offloaded).
     // Mark the same prefix of the written key list as hot for the report pass.
@@ -791,6 +831,7 @@ SeedOutcome RunRealSeedStage() {
             }
         }
     }
+
     client->unregister_buffer(buffer);
     numa_free(buffer, block_bytes);
     LOG(INFO) << "Real-data seed stage done: written=" << outcome.stats.written
@@ -799,7 +840,9 @@ SeedOutcome RunRealSeedStage() {
               << " read_failures=" << outcome.stats.read_failures;
     return outcome;
 }
+
 }  // namespace
+
 int main(int argc, char* argv[]) {
     google::InitGoogleLogging(argv[0]);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -808,9 +851,11 @@ int main(int argc, char* argv[]) {
                       "--memory_used_ratio must be within [0, 1]";
         return 1;
     }
+
     std::atomic<uint64_t> eviction_commands{0};
     std::atomic<uint64_t> prefetch_commands{0};
     std::atomic<uint64_t> admission_commands{0};
+
     // The SubMaster-side CFM component (embedded mode) or the ownership
     // resolver used by the remote reporter.
     std::shared_ptr<CfmService> embedded_service;
@@ -857,15 +902,17 @@ int main(int argc, char* argv[]) {
         ownership_client = std::make_shared<CfmOwnershipClient>(
             resolver, std::chrono::milliseconds(FLAGS_cfm_rpc_timeout_ms));
         ownership_client->set_forward_storage(FLAGS_report_forward_storage);
-        deployment_description = "remote SubMaster (s) via CFM coro_rpc";
+        deployment_description = "remote SubMaster(s) via CFM coro_rpc";
     }
-    // Real-data seeding runs before the simulated request stream (" 先种子后仿
-    // 真 "): the SubMaster must hold real replicas for reported keys before the
+
+    // Real-data seeding runs before the simulated request stream ("先种子后仿
+    // 真"): the SubMaster must hold real replicas for reported keys before the
     // report-driven policy cycle can execute eviction/promotion/prefetch
     // against them. Only meaningful with a real SubMaster endpoint
     // (--cfm_endpoint) plus RealClient parameters; otherwise it is a no-op.
     const SeedOutcome seed_outcome = RunRealSeedStage();
     const SeedStats& seed_stats = seed_outcome.stats;
+
     IoPatternRuntime::Config source_config;
     source_config.report_capacity = FLAGS_report_capacity;
     source_config.max_analysis_keys = FLAGS_max_analysis_keys;
@@ -889,16 +936,19 @@ int main(int argc, char* argv[]) {
             .prefetch = [](const PrefetchPlan&) { return ErrorCode::OK; },
             .admission = [](const AdmissionResult&) { return ErrorCode::OK; }},
         source_config);
+
     const auto send_snapshot = [&](const IoPatternSnapshot& snapshot) -> bool {
         return ownership_client
                    ? ownership_client->ReportSnapshot(snapshot) == ErrorCode::OK
                    : (embedded_channel &&
                       embedded_channel->SendSnapshot(snapshot));
     };
+
     LatencyStats report_latency;
     uint64_t failed_reports = 0;
     uint64_t total_blocks = 0;
     const auto benchmark_start = Clock::now();
+
     // When a real seed set was written, report exactly those keys (the ones
     // with real replicas) instead of the synthetic request stream. Synthetic
     // keys never stored on the SubMaster pollute the merged snapshot: the
@@ -978,6 +1028,7 @@ int main(int argc, char* argv[]) {
                   << " cold=" << real_snapshot.keys.size() - hot_blocks
                   << " (synthetic request stream skipped)";
     }
+
     // Promotion test: wait for IO Pattern cold eviction to cull MEMORY
     // replicas, then re-read seeded keys to trigger promotion-on-hit.
     if (FLAGS_promotion_test_wait_sec > 0 && !seed_outcome.keys.empty()) {
@@ -1108,7 +1159,7 @@ int main(int argc, char* argv[]) {
             // ready (already deleted by a fallback eviction) are filtered out
             // of the trigger report so the prefetch handler only sees objects
             // that actually exist with a LOCAL_DISK source.
-            std::vectorstd::string prefetch_keys = seed_outcome.keys;
+            std::vector<std::string> prefetch_keys = seed_outcome.keys;
             if (FLAGS_prefetch_ready_poll_sec > 0 &&
                 !seed_outcome.keys.empty() &&
                 (tiers & CacheTierBit(CacheTier::kLocalDisk)) != 0) {
@@ -1237,6 +1288,7 @@ int main(int argc, char* argv[]) {
             numa_free(buffer, block_bytes);
         }
     }
+
     // S7.5: after promotion completes, re-mark ALL seeded keys cold so the
     // report-driven cold eviction must re-evict the freshly promoted MEMORY
     // replicas (they hold LOCAL_DISK copies, so eviction deletes the MEMORY
@@ -1283,6 +1335,7 @@ int main(int argc, char* argv[]) {
         }
         LOG(INFO) << "[PROMO-RECYCLE] recycle wait done";
     }
+
     for (size_t request_index = 0; request_index < FLAGS_requests;
          ++request_index) {
         if (real_seed_mode) break;  // real keys already reported above
@@ -1294,11 +1347,13 @@ int main(int argc, char* argv[]) {
                                          request.accesses[i]);
         }
         source_runtime->RecordStorageMetric(request.snapshot.storage.front());
+
         const auto report_start = Clock::now();
         const bool sent = send_snapshot(request.snapshot);
         report_latency.Record(ToMicroseconds(Clock::now() - report_start));
         if (!sent) ++failed_reports;
     }
+
     // S11.6: prefetch failure path. Synthetic keys claim a LOCAL_DISK replica
     // that does not exist, so the master prefetch handler finds no real object
     // (kNotFound -> OBJECT_NOT_FOUND) or no LOCAL_DISK source and returns a
@@ -1345,17 +1400,20 @@ int main(int argc, char* argv[]) {
     }
     const auto submission_seconds =
         std::chrono::duration<double>(Clock::now() - benchmark_start).count();
+
     // Stop joins the reporter worker and performs its final flush. No new
     // metric batch can reach the SubMaster after this returns.
     source_runtime->StopReports();
     std::this_thread::sleep_for(
         std::chrono::milliseconds(FLAGS_report_flush_wait_ms));
+
     // The report-driven worker executes one cycle per merged report. Wait for
     // it to drain before reading handler counters / snapshots so the printed
     // numbers are deterministic.
     if (cfm_runtime && cfm_runtime->report_driven_execution()) {
         cfm_runtime->WaitForReportDrivenIdle();
     }
+
     // Embedded mode: when the report-driven worker is disabled, evaluate and
     // execute policy once locally (the pre-worker high-watermark trigger that
     // the production EvictionThreadFunc runs). With report_driven_execution
@@ -1375,8 +1433,10 @@ int main(int argc, char* argv[]) {
             LOG(WARNING) << "Local CFM evaluation degraded";
         }
     }
+
     const auto end_to_end_seconds =
         std::chrono::duration<double>(Clock::now() - benchmark_start).count();
+
     const auto source_snapshot = source_runtime->Snapshot();
     const auto source_metrics =
         source_runtime->ObservabilitySnapshot(end_to_end_seconds);
@@ -1388,6 +1448,7 @@ int main(int argc, char* argv[]) {
     const auto cfm_metrics =
         embedded_service ? embedded_service->Observability(end_to_end_seconds)
                          : IoPatternObservabilitySnapshot{};
+
     std::cout
         << "\n============================================================\n"
         << "CFM CLIENT BENCHMARK (vLLM inference request model)\n"
