@@ -600,7 +600,26 @@ MasterService::MasterService(const MasterServiceConfig& config)
                     uint64_t total_freed = 0;
                     uint64_t tier_down_attempts = 0;
                     uint64_t tier_down_queued = 0;
+                    uint64_t tier_down_in_flight = 0;
+                    uint64_t tier_down_paved = 0;
                     uint64_t tier_down_failed = 0;
+                    std::vector<std::string> tier_down_diag;
+                    const auto tier_down_outcome_name =
+                        [](TierDownOutcome outcome) -> const char* {
+                        switch (outcome) {
+                            case TierDownOutcome::kQueued:
+                                return "queued";
+                            case TierDownOutcome::kAlreadyInFlight:
+                                return "already_in_flight";
+                            case TierDownOutcome::kAlreadyPaved:
+                                return "already_paved";
+                            case TierDownOutcome::kNotFound:
+                                return "not_found";
+                            case TierDownOutcome::kPushFailed:
+                                return "push_failed";
+                        }
+                        return "unknown";
+                    };
                     std::unordered_map<TenantId, TenantCandidates, TenantIdHash>
                         targets;
                     for (const auto& candidate : plan.candidates) {
@@ -612,12 +631,29 @@ MasterService::MasterService(const MasterServiceConfig& config)
                         if (candidate.action ==
                             io_pattern::EvictionAction::kTierDown) {
                             ++tier_down_attempts;
-                            if (TryQueueTierDown(ObjectIdentity{
+                            const TierDownOutcome outcome =
+                                TryQueueTierDown(ObjectIdentity{
                                     candidate.object.tenant_id,
-                                    candidate.object.key})) {
-                                ++tier_down_queued;
-                            } else {
-                                ++tier_down_failed;
+                                    candidate.object.key});
+                            switch (outcome) {
+                                case TierDownOutcome::kQueued:
+                                    ++tier_down_queued;
+                                    break;
+                                case TierDownOutcome::kAlreadyInFlight:
+                                    ++tier_down_in_flight;
+                                    break;
+                                case TierDownOutcome::kAlreadyPaved:
+                                    ++tier_down_paved;
+                                    break;
+                                case TierDownOutcome::kNotFound:
+                                case TierDownOutcome::kPushFailed:
+                                    ++tier_down_failed;
+                                    break;
+                            }
+                            if (tier_down_diag.size() < 3) {
+                                tier_down_diag.push_back(
+                                    candidate.object.key + "=" +
+                                    tier_down_outcome_name(outcome));
                             }
                             continue;
                         }
@@ -632,13 +668,24 @@ MasterService::MasterService(const MasterServiceConfig& config)
                             tier_down_queued, std::memory_order_relaxed);
                         tier_down_failures_.fetch_add(
                             tier_down_failed, std::memory_order_relaxed);
+                        tier_down_skipped_in_flight_.fetch_add(
+                            tier_down_in_flight, std::memory_order_relaxed);
+                        tier_down_skipped_paved_.fetch_add(
+                            tier_down_paved, std::memory_order_relaxed);
                         LOG(WARNING)
                             << "[IO-PATTERN-TIER-DOWN] io_pattern tier down "
                                "plan_target="
                             << tier_down_target
                             << " attempts=" << tier_down_attempts
                             << " queued=" << tier_down_queued
+                            << " already_in_flight=" << tier_down_in_flight
+                            << " already_paved=" << tier_down_paved
                             << " failed=" << tier_down_failed;
+                        for (const auto& diag : tier_down_diag) {
+                            LOG(WARNING)
+                                << "[IO-PATTERN-TIER-DOWN]   candidate "
+                                << diag;
+                        }
                     }
                     for (const auto& [tenant, target] : targets) {
                         const auto result = EvictTenantMemoryForQuota(
@@ -8383,20 +8430,25 @@ tl::expected<std::vector<UUID>, ErrorCode> MasterService::PushOffloadingQueue(
 // bookkeeping used by the offload-on-evict path (refcnt pin plus an
 // offloading_tasks entry, both released when the client reports the copy back),
 // and deliberately frees nothing: demotion is a copy, not a reclaim.
-bool MasterService::TryQueueTierDown(const ObjectIdentity& object_id) {
+MasterService::TierDownOutcome MasterService::TryQueueTierDown(
+    const ObjectIdentity& object_id) {
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
-        return false;
+        return TierDownOutcome::kNotFound;
     }
     auto& metadata = accessor.Get();
     auto& tenant_state = accessor.GetTenantState();
 
-    // One offload per key. An in-flight task already pins the MEMORY replica this
-    // demotion would pin again, and the holder's queue is keyed by the object, so
-    // re-pushing would only fail with OBJECT_ALREADY_EXISTS. The key is already
-    // on its way down, which is what the caller asked for.
+    // Already on disk: a demotion is a copy down, so there is nothing left to
+    // copy. Reported separately from kQueued because a driver that keeps
+    // selecting paved keys is not making progress.
+    if (metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+        return TierDownOutcome::kAlreadyPaved;
+    }
+    // A copy is already in flight. Re-pushing would only fail with
+    // OBJECT_ALREADY_EXISTS, and like kAlreadyPaved this is not progress.
     if (tenant_state.offloading_tasks.count(object_id.user_key) > 0) {
-        return true;
+        return TierDownOutcome::kAlreadyInFlight;
     }
 
     const auto now = std::chrono::system_clock::now();
@@ -8423,7 +8475,7 @@ bool MasterService::TryQueueTierDown(const ObjectIdentity& object_id) {
             }
             queued = true;
         });
-    return queued;
+    return queued ? TierDownOutcome::kQueued : TierDownOutcome::kPushFailed;
 }
 
 // Promotion-on-hit

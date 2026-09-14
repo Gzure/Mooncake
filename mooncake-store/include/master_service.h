@@ -1008,6 +1008,18 @@ class MasterService {
     uint64_t tier_down_failure_count() const {
         return tier_down_failures_.load(std::memory_order_relaxed);
     }
+    /// Candidates skipped because their disk copy is still in flight: a
+    /// non-zero, persistent value means the tier-down driver is waiting on the
+    /// client's offload queue rather than making progress.
+    uint64_t tier_down_skipped_in_flight_count() const {
+        return tier_down_skipped_in_flight_.load(std::memory_order_relaxed);
+    }
+    /// Candidates skipped because they already hold a LOCAL_DISK replica. A
+    /// persistent value means selection is re-picking keys that are already
+    /// paved down (each cycle's budget is being spent on nothing).
+    uint64_t tier_down_skipped_paved_count() const {
+        return tier_down_skipped_paved_.load(std::memory_order_relaxed);
+    }
 
    private:
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
@@ -1811,11 +1823,20 @@ class MasterService {
      * replica and never frees bytes, so the caller must not count its result as
      * reclaimed memory. Acquires its own RW shard accessor; safe to call from
      * the io_pattern eviction handler, which does not hold one while this runs.
-     * Returns false when the key vanished, has no completed MEMORY replica, or
-     * the holder client cannot accept the offload. A key that is already queued
-     * counts as success: it is already on its way down.
+     *
+     * The outcome is reported instead of a bare bool: "nothing left to do" and
+     * "queued" are operationally different, and collapsing a key that already
+     * holds a LOCAL_DISK replica -- or whose copy is still in flight -- into
+     * success is what hides a spinning tier-down driver.
      */
-    bool TryQueueTierDown(const ObjectIdentity& object_id);
+    enum class TierDownOutcome {
+        kQueued,
+        kAlreadyInFlight,
+        kAlreadyPaved,
+        kNotFound,
+        kPushFailed,
+    };
+    TierDownOutcome TryQueueTierDown(const ObjectIdentity& object_id);
     void RecordOrUpdateCandidate(TenantState& tenant_state,
                                  const std::string& key, uint8_t sketch_score,
                                  PromotionCandidateReason reason,
@@ -2291,6 +2312,10 @@ class MasterService {
     std::atomic<uint64_t> tier_down_attempts_{0};
     std::atomic<uint64_t> tier_down_successes_{0};
     std::atomic<uint64_t> tier_down_failures_{0};
+    // Outcomes that are neither progress nor failure. Kept separate so a stalled
+    // driver is visible instead of being counted as successful demotions.
+    std::atomic<uint64_t> tier_down_skipped_in_flight_{0};
+    std::atomic<uint64_t> tier_down_skipped_paved_{0};
 
     const std::string ha_backend_type_;
 

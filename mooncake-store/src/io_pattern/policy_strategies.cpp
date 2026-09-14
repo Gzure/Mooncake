@@ -69,6 +69,17 @@ EvictionPlan ScoreBasedEvictionOps::Evaluate(const PolicyContext& context,
     if (context.tier_down) {
         plan.tier_down_target_bytes = target_bytes;
     }
+    // A demotion copies the key down and keeps its MEMORY replica, so a key that
+    // already has a replica below this tier has nothing left to copy. It must be
+    // excluded or the driver spins forever on the same victims: the key stays an
+    // L1 candidate, the scorer prefers lower-replica-backed victims for eviction
+    // (see lower_replica_weight below), and every cycle would spend its whole
+    // budget re-copying the same keys while the rest of the cold set is never
+    // paved. Eviction has no such problem -- it removes the replica, so the next
+    // cycle picks fresh victims -- which is why this exclusion is tier-down only.
+    const auto is_already_paved = [&context, tier](const KeyMetrics& key) {
+        return context.tier_down && HasLowerTierReplica(key, tier);
+    };
     uint64_t max_block_size = 0;
     uint32_t max_other_replicas = 0;
     for (const auto& key : context.snapshot.keys) {
@@ -77,6 +88,9 @@ EvictionPlan ScoreBasedEvictionOps::Evaluate(const PolicyContext& context,
         }
         if (context.min_idle_time_us != 0 &&
             key.idle_time_us < context.min_idle_time_us) {
+            continue;
+        }
+        if (is_already_paved(key)) {
             continue;
         }
         max_block_size = std::max(max_block_size, key.block_size);
@@ -89,6 +103,9 @@ EvictionPlan ScoreBasedEvictionOps::Evaluate(const PolicyContext& context,
         }
         if (context.min_idle_time_us != 0 &&
             key.idle_time_us < context.min_idle_time_us) {
+            continue;
+        }
+        if (is_already_paved(key)) {
             continue;
         }
         const auto* pattern = FindPattern(key.object, context.analysis);

@@ -56,6 +56,18 @@ class OffloadOnEvictTest : public ::testing::Test {
             "report_metric_batch", codec.EncodeMetricBatch(batch));
     }
 
+    // Friend access to the tier-event hook the master uses when an offload
+    // completes, so a test can make a key look already-paved without having to
+    // drive a whole offload round trip.
+    static void MarkLowerTierReplicaForTesting(MasterService* service,
+                                               const std::string& key,
+                                               io_pattern::CacheTier tier) {
+        service->io_pattern_runtime_->RecordTierEvent(io_pattern::CacheEvent{
+            .type = io_pattern::CacheEventType::kInserted,
+            .object = {TenantId::Default(), key},
+            .target_tier = tier});
+    }
+
     // A demotion must leave a readable MEMORY replica behind; an eviction must
     // not. Reads the same client-facing view a Get would.
     bool HasCompleteMemoryReplica(MasterService& service,
@@ -660,6 +672,59 @@ TEST_F(OffloadOnEvictTest, TierDownDriverDemotesReportedKeyWithoutReclaiming) {
     EXPECT_GE(service->tier_down_attempt_count(), 1u);
     EXPECT_GE(service->tier_down_success_count(), 1u);
     EXPECT_EQ(service->tier_down_failure_count(), 0u);
+
+    service->RemoveAll();
+}
+
+// End to end through the driver: a key that already holds a lower-tier replica
+// must not consume the tier-down budget, otherwise the same keys are re-copied
+// every cycle and the SSD never grows past one budget's worth.
+TEST_F(OffloadOnEvictTest, TierDownDriverPavesFreshKeysBeforePavedOnes) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offload_on_evict = true;
+    config.default_kv_lease_ttl = 0;
+    // Exactly one object per cycle, so the chosen candidate is unambiguous.
+    config.io_pattern_tier_down_bytes_per_cycle = 4096;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "tier_down_progress_segment",
+                              kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    PutObject(*service, ctx.client_id, "td_paved", 4096);
+    PutObject(*service, ctx.client_id, "td_fresh", 4096);
+    // "td_paved" was put first, so it is the colder key and would normally win
+    // the budget. Marking it as already holding a lower-tier replica is what an
+    // offload completion does, and it must hand the budget to "td_fresh".
+    MarkLowerTierReplicaForTesting(service.get(), "td_paved",
+                                   io_pattern::CacheTier::kL3NofSsd);
+
+    io_pattern::MetricBatch batch;
+    for (const char* key : {"td_paved", "td_fresh"}) {
+        batch.accesses.push_back(io_pattern::AccessRecord{
+            .object = {TenantId::Default(), key},
+            .observed_at_ns = 1,
+            .block_size = 4096,
+            .tier = io_pattern::CacheTier::kL1Host,
+            .operation = io_pattern::IoOperation::kGet,
+            .is_hit = true});
+    }
+    ASSERT_TRUE(SendIoPatternReport(service.get(), batch));
+
+    std::unordered_map<std::string, int64_t> queued;
+    WaitUntil([&] {
+        queued = DrainOffloadQueue(*service, ctx.client_id);
+        return !queued.empty();
+    });
+    ASSERT_EQ(queued.size(), 1u);
+    EXPECT_TRUE(queued.count("td_fresh") > 0)
+        << "tier down re-picked a key that already has a disk replica";
+    // Both keys keep serving from MEMORY: demotion is a copy, not a reclaim.
+    EXPECT_TRUE(HasCompleteMemoryReplica(*service, "td_paved"));
+    EXPECT_TRUE(HasCompleteMemoryReplica(*service, "td_fresh"));
 
     service->RemoveAll();
 }

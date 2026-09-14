@@ -1905,6 +1905,45 @@ TEST(IoPatternFrameworkTest, TierDownContextLabelsCandidatesAndBudget) {
               reclaimed.candidates.front().target_tier);
 }
 
+// A demotion keeps the MEMORY replica, so a key that already has a replica below
+// it has nothing left to copy down. Without that exclusion the driver spins on
+// the same keys every cycle -- they stay L1 candidates and the eviction scorer
+// actively prefers lower-replica-backed victims -- so the rest of the cold set is
+// never paved and the SSD never grows past one budget.
+TEST(IoPatternFrameworkTest, TierDownSkipsKeysThatAlreadyHaveALowerReplica) {
+    PolicyContext context;
+    context.snapshot.keys = {
+        KeyMetrics{.object = {TenantId("tenant"), "already-paved"},
+                   .block_size = 64,
+                   .replica_tiers = CacheTierBit(CacheTier::kL1Host) |
+                                    CacheTierBit(CacheTier::kL3NofSsd)},
+        KeyMetrics{.object = {TenantId("tenant"), "not-paved"},
+                   .block_size = 64,
+                   .replica_tiers = CacheTierBit(CacheTier::kL1Host)},
+    };
+    context.analysis.keys = {
+        KeyPattern{.object = context.snapshot.keys[0].object},
+        KeyPattern{.object = context.snapshot.keys[1].object},
+    };
+
+    ScoreBasedEvictionOps ops;
+
+    // Eviction keeps both keys eligible: the exclusion below is tier-down only,
+    // and the scorer still ranks the lower-replica-backed key first as the safe
+    // victim to reclaim.
+    const auto reclaimed = ops.Evaluate(context, CacheTier::kL1Host, 128);
+    ASSERT_EQ(reclaimed.candidates.size(), 2);
+    EXPECT_EQ(reclaimed.candidates.front().object.key, "already-paved");
+    EXPECT_EQ(reclaimed.candidates.front().action, EvictionAction::kEvict);
+
+    // Tier down must only consider the key that still needs a disk copy.
+    context.tier_down = true;
+    const auto demoted = ops.Evaluate(context, CacheTier::kL1Host, 128);
+    ASSERT_EQ(demoted.candidates.size(), 1);
+    EXPECT_EQ(demoted.candidates.front().object.key, "not-paved");
+    EXPECT_EQ(demoted.candidates.front().action, EvictionAction::kTierDown);
+}
+
 TEST(IoPatternFrameworkTest, PrefetchRequiresConfidenceAndNeverPromotesToHbm) {
     PolicyContext context;
     context.snapshot.keys = {
