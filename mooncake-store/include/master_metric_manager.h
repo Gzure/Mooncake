@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -11,6 +12,10 @@
 #include "ylt/metric/histogram.hpp"
 
 namespace mooncake {
+
+namespace io_pattern {
+class IoPatternRuntime;
+}
 
 class MasterMetricManager {
    public:
@@ -316,6 +321,12 @@ class MasterMetricManager {
     int64_t get_io_pattern_report_admission_failures();
     int64_t get_io_pattern_report_degraded();
 
+    // Scrape the local runtime directly, including access-only traffic. A weak
+    // reference keeps the metrics singleton from extending MasterService life.
+    void set_io_pattern_runtime(
+        std::weak_ptr<io_pattern::IoPatternRuntime> runtime);
+    void clear_io_pattern_runtime(const io_pattern::IoPatternRuntime* runtime);
+
     // PutStart Discard Metrics
     void inc_put_start_discard_cnt(int64_t count, int64_t size);
     void inc_put_start_release_cnt(int64_t count, int64_t size);
@@ -447,6 +458,7 @@ class MasterMetricManager {
 
     // Update all metrics once to ensure zero values are serialized
     void update_metrics_for_zero_output();
+    std::string serialize_io_pattern_metrics();
     std::string get_summary_string(bool update_summary_snapshot);
 
     struct SummaryCounters {
@@ -549,6 +561,8 @@ class MasterMetricManager {
 
     // --- Metric Members ---
     std::mutex summary_snapshot_mutex_;
+    std::mutex io_pattern_runtime_mutex_;
+    std::weak_ptr<io_pattern::IoPatternRuntime> io_pattern_runtime_;
     SummarySnapshot summary_snapshot_;
 
     // Memory Storage Metrics

@@ -18,6 +18,7 @@
 #include "types.h"
 #include "master_config.h"
 #include "master_metric_manager.h"
+#include "io_pattern/runtime.h"
 
 namespace mooncake::test {
 
@@ -1019,6 +1020,38 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     // Clean up.
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     service_.Remove(ssd_only_key, "default");
+}
+
+TEST_F(MasterMetricsTest, AdminMetricsExposeIoPatternFeedbackFromAccesses) {
+    const int http_port = getFreeTcpPort();
+    WrappedMasterServiceConfig config;
+    config.enable_metric_reporting = false;
+    WrappedMasterService service(config);
+    MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
+                                   /*enable_metric_reporting=*/true);
+    ASSERT_TRUE(admin_server.Start());
+
+    // Exercise the production CFM ingress and MasterService registration.
+    io_pattern::MetricBatch batch;
+    for (int i = 0; i < 64; ++i) {
+        batch.accesses.push_back(
+            {.object = {TenantId::Default(), "missing"}, .is_hit = false});
+    }
+    io_pattern::CfmBinaryCodec codec;
+    ASSERT_TRUE(service.CfmRpcEndpoint().Send("report_metric_batch",
+                                              codec.EncodeMetricBatch(batch)));
+    const auto response = FetchUrl(http_port, "/metrics");
+    ASSERT_EQ(response.http_status, 200);
+    EXPECT_NE(
+        response.body.find("\nmaster_io_pattern_feedback_samples 1.000000\n"),
+        std::string::npos);
+    EXPECT_NE(
+        response.body.find("# TYPE master_io_pattern_collect_latency_us gauge"),
+        std::string::npos);
+    EXPECT_NE(response.body.find(
+                  "# TYPE master_io_pattern_policy_decisions_total counter"),
+              std::string::npos);
+    admin_server.Stop();
 }
 
 }  // namespace mooncake::test

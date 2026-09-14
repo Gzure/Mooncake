@@ -8,6 +8,7 @@
 #include <cmath>
 
 #include "utils.h"
+#include "io_pattern/runtime.h"
 
 namespace mooncake {
 
@@ -1880,6 +1881,97 @@ int64_t MasterMetricManager::get_update_task_failures() {
     return mark_task_to_complete_failures_.value();
 }
 
+void MasterMetricManager::set_io_pattern_runtime(
+    std::weak_ptr<io_pattern::IoPatternRuntime> runtime) {
+    std::lock_guard lock(io_pattern_runtime_mutex_);
+    io_pattern_runtime_ = std::move(runtime);
+}
+
+void MasterMetricManager::clear_io_pattern_runtime(
+    const io_pattern::IoPatternRuntime* runtime) {
+    std::lock_guard lock(io_pattern_runtime_mutex_);
+    if (io_pattern_runtime_.lock().get() == runtime)
+        io_pattern_runtime_.reset();
+}
+
+std::string MasterMetricManager::serialize_io_pattern_metrics() {
+    io_pattern::IoPatternObservabilitySnapshot observation;
+    io_pattern::PolicyFeedbackStats feedback;
+    {
+        // Unregister waits for snapshots and their temporary strong reference
+        // to finish, so a scrape cannot defer runtime worker shutdown beyond
+        // the lifetime of the MasterService captured by its handlers.
+        std::lock_guard lock(io_pattern_runtime_mutex_);
+        auto runtime = io_pattern_runtime_.lock();
+        if (!runtime) return {};
+        observation = runtime->ObservabilitySnapshot();
+        feedback = runtime->FeedbackSnapshot();
+    }
+
+    // Serialize snapshots rather than incrementing counters by cumulative
+    // values. Local metric objects keep concurrent scrapes independent and
+    // cannot retain stale values from a previous runtime.
+    std::string result;
+    const auto gauge = [&result](const char* name, const char* help,
+                                 double value) {
+        ylt::metric::gauge_d metric(name, help);
+        metric.update(value);
+        metric.serialize(result);
+    };
+    const auto counter = [&result](const char* name, const char* help,
+                                   uint64_t value) {
+        ylt::metric::counter_t metric(name, help);
+        metric.inc(value);
+        metric.serialize(result);
+    };
+    gauge("master_io_pattern_collect_latency_us",
+          "Maximum collection latency in microseconds since runtime startup",
+          observation.collect_latency_us);
+    gauge("master_io_pattern_analyze_latency_us",
+          "Maximum analysis latency in microseconds since runtime startup",
+          observation.analyze_latency_us);
+    gauge("master_io_pattern_policy_decision_qps",
+          "Average policy decisions per second since runtime startup; use rate "
+          "of master_io_pattern_policy_decisions_total for a rolling rate",
+          observation.policy_decision_qps);
+    counter("master_io_pattern_policy_decisions_total",
+            "Total policy decisions since runtime startup",
+            observation.policy_decisions);
+    gauge("master_io_pattern_strategy_hit_rate",
+          "Fraction of policy decisions with eviction or prefetch candidates",
+          observation.strategy_hit_rate);
+    gauge("master_io_pattern_false_positive_rate",
+          "Observed prefetch misses divided by total policy decisions",
+          observation.false_positive_rate);
+    counter("master_io_pattern_degrade_count",
+            "Total recorded degradation events since runtime startup",
+            observation.degrade_count);
+    counter("master_io_pattern_report_drop_count",
+            "Total collector drops recorded since runtime startup",
+            observation.report_drop_count);
+    gauge(
+        "master_io_pattern_hit_rate_delta",
+        "Mean hit rate delta in the bounded feedback sample window; automatic "
+        "samples compare consecutive groups of 64 accesses",
+        feedback.hit_rate_delta);
+    gauge("master_io_pattern_eviction_churn",
+          "Mean eviction feedback in the bounded sample window; automatic "
+          "samples are eviction candidate count divided by snapshot key count",
+          feedback.eviction_churn);
+    gauge("master_io_pattern_ttft_delta",
+          "Mean externally supplied TTFT delta in the bounded feedback sample "
+          "window; zero unless supplied via RecordFeedback",
+          feedback.ttft_delta);
+    gauge("master_io_pattern_prefetch_accuracy",
+          "Mean prefetch accuracy in the bounded feedback sample window; "
+          "samples without prefetch feedback currently contribute zero",
+          feedback.prefetch_accuracy);
+    gauge("master_io_pattern_feedback_samples",
+          "Number of samples currently retained in the feedback window",
+          feedback.samples);
+    return result;
+}
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -2053,6 +2145,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(io_pattern_report_admissions_);
     serialize_metric(io_pattern_report_admission_failures_);
     serialize_metric(io_pattern_report_degraded_);
+    ss << serialize_io_pattern_metrics();
 
     // Serialize PutStart Discard Metrics
     serialize_metric(put_start_discard_cnt_);

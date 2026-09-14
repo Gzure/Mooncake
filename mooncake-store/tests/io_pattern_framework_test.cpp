@@ -1,4 +1,5 @@
 #include "io_pattern/io_pattern.h"
+#include "master_metric_manager.h"
 #include "io_pattern/threshold_analyzer.h"
 #include "io_pattern/policy_strategies.h"
 
@@ -2248,6 +2249,85 @@ TEST(IoPatternFrameworkTest, AdmissionWatermarkFollowsTheConfiguredHighWatermark
     EXPECT_EQ(engine.DecideAdmission(key.object, CacheTier::kL1Host, context)
                   .decision,
               AdmissionDecision::kRejectWatermark);
+}
+
+TEST(IoPatternFrameworkTest, RuntimeMetricsExport) {
+    auto& metrics = MasterMetricManager::instance();
+    IoPatternRuntime::Config config;
+    config.collector.max_total_keys = 1;
+    auto runtime = std::make_shared<IoPatternRuntime>(
+        IoPatternRuntime::Handlers{}, config);
+    metrics.set_io_pattern_runtime(runtime);
+
+    const auto value = [](const std::string& text, const std::string& name) {
+        const auto offset = text.find("\n" + name + " ");
+        EXPECT_NE(offset, std::string::npos) << name;
+        return offset == std::string::npos
+                   ? -1.0
+                   : std::stod(text.substr(offset + name.size() + 2));
+    };
+    const auto initial = metrics.serialize_metrics();
+    for (const auto* name :
+         {"policy_decisions_total", "feedback_samples", "collect_latency_us",
+          "analyze_latency_us", "strategy_hit_rate", "false_positive_rate",
+          "degrade_count", "report_drop_count"}) {
+        EXPECT_DOUBLE_EQ(
+            value(initial, std::string("master_io_pattern_") + name), 0.0);
+    }
+    runtime->RecordFeedback({.hit_rate_delta = -0.25F,
+                             .eviction_churn = 0.5F,
+                             .ttft_delta = -0.125F,
+                             .prefetch_accuracy = 0.75F});
+    runtime->Plan(CacheTier::kL1Host, 0, {});
+    const auto first = metrics.serialize_metrics();
+    EXPECT_DOUBLE_EQ(value(first, "master_io_pattern_hit_rate_delta"), -0.25);
+    EXPECT_DOUBLE_EQ(value(first, "master_io_pattern_eviction_churn"), 0.5);
+    EXPECT_DOUBLE_EQ(value(first, "master_io_pattern_ttft_delta"), -0.125);
+    EXPECT_DOUBLE_EQ(value(first, "master_io_pattern_prefetch_accuracy"), 0.75);
+    EXPECT_DOUBLE_EQ(value(first, "master_io_pattern_feedback_samples"), 1.0);
+    EXPECT_DOUBLE_EQ(value(first, "master_io_pattern_policy_decisions_total"),
+                     1.0);
+    EXPECT_GT(value(first, "master_io_pattern_policy_decision_qps"), 0.0);
+    // Scrapes must not increment cumulative counters or consume feedback.
+    const auto second = metrics.serialize_metrics();
+    EXPECT_DOUBLE_EQ(value(second, "master_io_pattern_policy_decisions_total"),
+                     1.0);
+    EXPECT_DOUBLE_EQ(value(second, "master_io_pattern_feedback_samples"), 1.0);
+    EXPECT_NE(
+        second.find("# TYPE master_io_pattern_policy_decisions_total counter"),
+        std::string::npos);
+    EXPECT_NE(second.find("# TYPE master_io_pattern_hit_rate_delta gauge"),
+              std::string::npos);
+
+    runtime->RecordAccess(
+        "one", {.object = {TenantId::Default(), "one"}, .is_hit = true});
+    runtime->RecordAccess(
+        "two", {.object = {TenantId::Default(), "two"}, .is_hit = true});
+    runtime->Execute(CacheTier::kL1Host, 0, {});
+    const auto degraded = metrics.serialize_metrics();
+    EXPECT_DOUBLE_EQ(value(degraded, "master_io_pattern_report_drop_count"),
+                     1.0);
+    EXPECT_GE(value(degraded, "master_io_pattern_degrade_count"), 1.0);
+
+    // The singleton must not retain a runtime (or its MasterService handlers).
+    std::weak_ptr<IoPatternRuntime> weak = runtime;
+    runtime.reset();
+    EXPECT_TRUE(weak.expired());
+    EXPECT_EQ(metrics.serialize_metrics().find(
+                  "# TYPE master_io_pattern_hit_rate_delta "),
+              std::string::npos);
+
+    auto replacement =
+        std::make_shared<IoPatternRuntime>(IoPatternRuntime::Handlers{});
+    metrics.set_io_pattern_runtime(replacement);
+    metrics.clear_io_pattern_runtime(nullptr);
+    EXPECT_DOUBLE_EQ(value(metrics.serialize_metrics(),
+                           "master_io_pattern_policy_decisions_total"),
+                     0.0);
+    metrics.clear_io_pattern_runtime(replacement.get());
+    EXPECT_EQ(metrics.serialize_metrics().find(
+                  "# TYPE master_io_pattern_hit_rate_delta "),
+              std::string::npos);
 }
 
 }  // namespace

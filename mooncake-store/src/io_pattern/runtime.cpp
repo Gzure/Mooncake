@@ -638,12 +638,21 @@ void IoPatternRuntime::RecordFeedback(PolicyFeedbackSample sample) {
     }
 }
 
+PolicyFeedbackStats IoPatternRuntime::FeedbackSnapshot() const {
+    return feedback_.Snapshot();
+}
+
 IoPatternSnapshot IoPatternRuntime::Snapshot() const {
     return collector_->GetSnapshot();
 }
 
 IoPatternObservabilitySnapshot IoPatternRuntime::ObservabilitySnapshot(
     double window_seconds) const {
+    if (window_seconds <= 0.0) {
+        window_seconds = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - started_at_)
+                             .count();
+    }
     return observability_.Snapshot(window_seconds);
 }
 

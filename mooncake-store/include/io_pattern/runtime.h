@@ -191,7 +191,9 @@ class IoPatternRuntime final {
                            std::string session_id = {});
 
     void RecordFeedback(PolicyFeedbackSample sample);
+    PolicyFeedbackStats FeedbackSnapshot() const;
     IoPatternSnapshot Snapshot() const;
+    // With no explicit window, QPS is averaged over this runtime's lifetime.
     IoPatternObservabilitySnapshot ObservabilitySnapshot(
         double window_seconds = 0.0) const;
     bool degraded() const;
@@ -248,6 +250,8 @@ class IoPatternRuntime final {
     PolicyFeedbackWindow feedback_;
     AdaptivePolicyTuner tuner_;
     IoPatternObservability observability_;
+    const std::chrono::steady_clock::time_point started_at_{
+        std::chrono::steady_clock::now()};
     mutable std::mutex feedback_state_mutex_;
     std::unordered_set<ObjectRef, ObjectRefHash> pending_prefetches_;
     uint64_t feedback_accesses_{0};

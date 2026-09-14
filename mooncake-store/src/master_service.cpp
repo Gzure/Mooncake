@@ -728,6 +728,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                         object_id, /*record_candidate=*/false));
                 }},
         std::move(io_pattern_config));
+    MasterMetricManager::instance().set_io_pattern_runtime(io_pattern_runtime_);
     io_pattern_cfm_service_ = std::make_shared<io_pattern::CfmService>(
         io_pattern_runtime_);
 
@@ -1930,6 +1931,8 @@ MasterService::~MasterService() {
 
     // Its admission worker executes handlers that capture this service. Stop
     // and join it while all handler dependencies are still alive.
+    MasterMetricManager::instance().clear_io_pattern_runtime(
+        io_pattern_runtime_.get());
     io_pattern_cfm_service_.reset();
     io_pattern_runtime_.reset();
 
