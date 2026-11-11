@@ -153,6 +153,13 @@ DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
 DEFINE_double(nof_eviction_high_watermark_ratio,
               mooncake::DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in NoF SSD");
+DEFINE_bool(io_pattern_enabled, true,
+            "Enable the master-side IO Pattern subsystem (embedded CFM: "
+            "collector, analyzers, report-driven policy worker and admission "
+            "worker). Disabling it removes the subsystem from the Put/Get path "
+            "and makes the eviction thread fall back to the legacy "
+            "BatchEvict(), which is the pre-io_pattern baseline; this is the "
+            "A/B switch for latency comparisons");
 DEFINE_bool(io_pattern_cold_eviction, false,
             "Enable report-driven cold-data eviction (embedded CFM component): "
             "merged client reports may drive bounded evictions of the coldest "
@@ -578,6 +585,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("nof_eviction_high_watermark_ratio",
                              &master_config.nof_eviction_high_watermark_ratio,
                              FLAGS_nof_eviction_high_watermark_ratio);
+    default_config.GetBool("io_pattern_enabled",
+                           &master_config.io_pattern_enabled,
+                           FLAGS_io_pattern_enabled);
     default_config.GetBool("io_pattern_cold_eviction",
                            &master_config.io_pattern_cold_eviction,
                            FLAGS_io_pattern_cold_eviction);
@@ -960,6 +970,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.nof_eviction_high_watermark_ratio =
             FLAGS_nof_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("io_pattern_enabled", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.io_pattern_enabled = FLAGS_io_pattern_enabled;
     }
     if ((google::GetCommandLineFlagInfo("io_pattern_cold_eviction", &info) &&
          !info.is_default) ||

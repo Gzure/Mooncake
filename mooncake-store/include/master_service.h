@@ -57,7 +57,8 @@ namespace mooncake {
 namespace io_pattern {
 class CfmService;
 class IoPatternRuntime;
-}
+struct AccessRecord;
+}  // namespace io_pattern
 
 // Forward declaration for MasterSnapshotManager
 class MasterSnapshotManager;
@@ -1929,8 +1930,16 @@ class MasterService {
     auto PutEndInternal(const UUID& client_id, const ObjectMeta& object_meta,
                         const TenantId& tenant_id, ReplicaType replica_type,
                         uint32_t write_batch_size, bool overwrite,
-                        const std::string& operation_id = "")
+                        const std::string& operation_id = "",
+                        io_pattern::AccessRecord* io_access_out = nullptr)
         -> tl::expected<void, ErrorCode>;
+    // Write-path observation for the io_pattern collector. The RPC entry points
+    // call it after PutEndInternal returns, so the collector's global mutex is
+    // never taken while the snapshot/shard locks are held (P0-3 in
+    // docs/analyze/io_pattern_latency_review.md). No-op when the subsystem is
+    // disabled, and the admission enqueue is gated on promotion-on-hit because
+    // the promotion queue is the only primitive that hook can drive.
+    void RecordPutAccess(const io_pattern::AccessRecord& access);
 
     /**
      * @brief Helper to discard expired processing keys.

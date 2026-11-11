@@ -50,6 +50,12 @@ struct MasterConfig {
     double eviction_high_watermark_ratio;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
+    // Master-side IO Pattern subsystem (embedded CFM: collector, analyzers,
+    // report-driven policy worker, admission worker). Disabling it keeps the
+    // subsystem out of the request path entirely and makes the eviction thread
+    // fall back to the legacy BatchEvict(), i.e. the pre-io_pattern baseline.
+    // This is the A/B switch: one build, one flag, no code difference.
+    bool io_pattern_enabled = true;
     // Report-driven cold-data eviction driver (embedded CFM component).
     // When true, merged client reports may drive bounded evictions of the
     // coldest keys even when the memory watermark is not exceeded. All three
@@ -340,6 +346,10 @@ class MasterServiceSupervisorConfig {
     uint32_t io_pattern_admission_frequency_threshold = 2;
     double io_pattern_admission_watermark_ratio = -1.0;
     uint32_t promotion_max_per_heartbeat = 1;
+    // Master-side IO Pattern subsystem switch. Mirrors MasterConfig /
+    // WrappedMasterServiceConfig; carried through the supervisor config used by
+    // HA deployments.
+    bool io_pattern_enabled = true;
     // Report-driven cold-data eviction driver (embedded CFM component).
     // Mirrors MasterConfig / WrappedMasterServiceConfig; carried through the
     // supervisor config used by HA deployments.
@@ -388,6 +398,7 @@ class MasterServiceSupervisorConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_enabled = config.io_pattern_enabled;
         io_pattern_cold_eviction = config.io_pattern_cold_eviction;
         io_pattern_cold_eviction_bytes_per_cycle =
             config.io_pattern_cold_eviction_bytes_per_cycle;
@@ -597,6 +608,10 @@ class WrappedMasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Master-side IO Pattern subsystem switch: disabling it removes the
+    // subsystem from the request path and restores the pre-io_pattern eviction
+    // path (BatchEvict). See --io_pattern_enabled.
+    bool io_pattern_enabled = true;
     // Report-driven cold-data eviction driver (embedded CFM component).
     bool io_pattern_cold_eviction = false;
     uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
@@ -729,6 +744,7 @@ class WrappedMasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_enabled = config.io_pattern_enabled;
         io_pattern_cold_eviction = config.io_pattern_cold_eviction;
         io_pattern_cold_eviction_bytes_per_cycle =
             config.io_pattern_cold_eviction_bytes_per_cycle;
@@ -862,6 +878,7 @@ class WrappedMasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_enabled = config.io_pattern_enabled;
         io_pattern_cold_eviction = config.io_pattern_cold_eviction;
         io_pattern_cold_eviction_bytes_per_cycle =
             config.io_pattern_cold_eviction_bytes_per_cycle;
@@ -994,6 +1011,7 @@ class MasterServiceConfigBuilder {
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     bool enable_multi_tenants_ = false;
+    bool io_pattern_enabled_ = true;
     std::string tenant_quota_connector_type_ = "file";
     std::string tenant_quota_connector_uri_;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -1159,6 +1177,14 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_multi_tenants(bool enable) {
         enable_multi_tenants_ = enable;
+        return *this;
+    }
+
+    // A/B switch for the master-side IO Pattern subsystem (see
+    // --io_pattern_enabled). Exposed here so in-tree tests and the in-process
+    // master can disable it without touching gflags.
+    MasterServiceConfigBuilder& set_io_pattern_enabled(bool enable) {
+        io_pattern_enabled_ = enable;
         return *this;
     }
 
@@ -1332,6 +1358,10 @@ class MasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    // Master-side IO Pattern subsystem switch: disabling it removes the
+    // subsystem from the request path and restores the pre-io_pattern eviction
+    // path (BatchEvict). See --io_pattern_enabled.
+    bool io_pattern_enabled = true;
     // Report-driven cold-data eviction driver (embedded CFM component).
     bool io_pattern_cold_eviction = false;
     uint64_t io_pattern_cold_eviction_bytes_per_cycle = 0;
@@ -1460,6 +1490,7 @@ class MasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        io_pattern_enabled = config.io_pattern_enabled;
         io_pattern_cold_eviction = config.io_pattern_cold_eviction;
         io_pattern_cold_eviction_bytes_per_cycle =
             config.io_pattern_cold_eviction_bytes_per_cycle;
@@ -1591,6 +1622,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
     config.enable_multi_tenants = enable_multi_tenants_;
+    config.io_pattern_enabled = io_pattern_enabled_;
     config.tenant_quota_connector_type = tenant_quota_connector_type_;
     config.tenant_quota_connector_uri = tenant_quota_connector_uri_;
     config.enable_snapshot_restore = enable_snapshot_restore_;

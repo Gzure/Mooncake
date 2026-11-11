@@ -145,12 +145,22 @@ void IoPatternRuntime::RecordAccess(const std::string& key,
         std::lock_guard lock(feedback_state_mutex_);
         ++feedback_accesses_;
         feedback_hits_ += record.is_hit;
-        ObjectRef object = record.object;
-        if (!key.empty()) object.key = key;
-        if (pending_prefetches_.erase(object) != 0) {
-            feedback.prefetch_accuracy = record.is_hit ? 1.0F : 0.0F;
-            has_feedback = true;
-            if (!record.is_hit) observability_.RecordFalsePositive();
+        // pending_prefetches_ is empty unless a prefetch is in flight, so skip
+        // the key copy entirely on the normal path instead of building one
+        // ObjectRef per access just to probe an empty set.
+        if (!pending_prefetches_.empty()) {
+            const ObjectRef* object = &record.object;
+            ObjectRef patched_object;
+            if (!key.empty() && record.object.key != key) {
+                patched_object = record.object;
+                patched_object.key = key;
+                object = &patched_object;
+            }
+            if (pending_prefetches_.erase(*object) != 0) {
+                feedback.prefetch_accuracy = record.is_hit ? 1.0F : 0.0F;
+                has_feedback = true;
+                if (!record.is_hit) observability_.RecordFalsePositive();
+            }
         }
         // A completed 64-access window is a stable, bounded source of actual
         // hit-rate deltas. TTFT remains supplied by the inference bridge via

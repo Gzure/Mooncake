@@ -497,13 +497,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
             // eviction would overstate reclaim. Its outcome is visible through
             // MasterService's own tier_down_attempt/success/failure counters.
             if (rpt.tier_down) {
-                LOG(INFO) << "[IO-PATTERN-TIER-DOWN] report-driven tier-down "
-                             "cycle="
-                          << rpt.cycle_id
-                          << " budget=" << rpt.eviction_target_bytes
-                          << " candidates=" << rpt.eviction_candidates
-                          << " status=" << static_cast<int>(rpt.eviction_status)
-                          << " skipped=" << rpt.skipped_dimensions;
+                // Cycle-level diagnostics are verbose: the report-driven worker
+                // runs on every report / tick, so these belong behind -v=1
+                // instead of on the INFO path (server-side INFO logging costs
+                // tens of microseconds per line once the sink is synchronous).
+                VLOG(1) << "[IO-PATTERN-TIER-DOWN] report-driven tier-down "
+                           "cycle="
+                        << rpt.cycle_id
+                        << " budget=" << rpt.eviction_target_bytes
+                        << " candidates=" << rpt.eviction_candidates
+                        << " status=" << static_cast<int>(rpt.eviction_status)
+                        << " skipped=" << rpt.skipped_dimensions;
             } else if (rpt.eviction_candidates != 0) {
                 metrics.inc_io_pattern_report_evictions();
                 if (rpt.eviction_status != ErrorCode::OK) {
@@ -522,25 +526,25 @@ MasterService::MasterService(const MasterServiceConfig& config)
                     metrics.inc_io_pattern_report_admission_failures();
                 }
             }
-            LOG(INFO) << "[IO-PATTERN-REPORT-CYCLE] cycle=" << rpt.cycle_id
-                      << " keys_analyzed=" << rpt.keys_analyzed
-                      << " analysis_elapsed_us=" << rpt.analysis_elapsed_us
-                      << " degraded=" << rpt.degraded
-                      << " skipped=" << rpt.skipped_dimensions
-                      << " eviction(tier="
-                      << static_cast<int>(rpt.eviction_tier)
-                      << ", bytes=" << rpt.eviction_target_bytes
-                      << ", candidates=" << rpt.eviction_candidates
-                      << ", status=" << static_cast<int>(rpt.eviction_status)
-                      << ", cold=" << rpt.cold_eviction
-                      << ", tier_down=" << rpt.tier_down << ")"
-                      << " prefetch(candidates=" << rpt.prefetch_candidates
-                      << ", status=" << static_cast<int>(rpt.prefetch_status)
-                      << ")"
-                      << " admission(candidates=" << rpt.admission_candidates
-                      << ", admitted=" << rpt.admissions_admitted
-                      << ", status=" << static_cast<int>(rpt.admission_status)
-                      << ")";
+            VLOG(1) << "[IO-PATTERN-REPORT-CYCLE] cycle=" << rpt.cycle_id
+                    << " keys_analyzed=" << rpt.keys_analyzed
+                    << " analysis_elapsed_us=" << rpt.analysis_elapsed_us
+                    << " degraded=" << rpt.degraded
+                    << " skipped=" << rpt.skipped_dimensions
+                    << " eviction(tier="
+                    << static_cast<int>(rpt.eviction_tier)
+                    << ", bytes=" << rpt.eviction_target_bytes
+                    << ", candidates=" << rpt.eviction_candidates
+                    << ", status=" << static_cast<int>(rpt.eviction_status)
+                    << ", cold=" << rpt.cold_eviction
+                    << ", tier_down=" << rpt.tier_down << ")"
+                    << " prefetch(candidates=" << rpt.prefetch_candidates
+                    << ", status=" << static_cast<int>(rpt.prefetch_status)
+                    << ")"
+                    << " admission(candidates=" << rpt.admission_candidates
+                    << ", admitted=" << rpt.admissions_admitted
+                    << ", status=" << static_cast<int>(rpt.admission_status)
+                    << ")";
         };
     // Promotion is the Store's only cross-tier primitive, and it can decline for
     // structural reasons the policy cannot influence: promotion disabled, no
@@ -664,7 +668,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                             tier_down_in_flight, std::memory_order_relaxed);
                         tier_down_skipped_paved_.fetch_add(
                             tier_down_paved, std::memory_order_relaxed);
-                        LOG(WARNING)
+                        VLOG(1)
                             << "[IO-PATTERN-TIER-DOWN] io_pattern tier down "
                                "plan_target="
                             << tier_down_target
@@ -674,7 +678,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                             << " already_paved=" << tier_down_paved
                             << " failed=" << tier_down_failed;
                         for (const auto& diag : tier_down_diag) {
-                            LOG(WARNING)
+                            VLOG(1)
                                 << "[IO-PATTERN-TIER-DOWN]   candidate "
                                 << diag;
                         }
@@ -711,7 +715,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                     ++snapshot_paved;
                                 }
                             }
-                            LOG(WARNING)
+                            VLOG(1)
                                 << "[IO-PATTERN-TIER-DOWN]   metadata=paved "
                                 << tier_down_paved << " of "
                                 << tier_down_attempts
@@ -729,7 +733,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                         total_freed
                                 ? std::numeric_limits<uint64_t>::max()
                                 : total_freed + result.freed_bytes;
-                        LOG(WARNING)
+                        VLOG(1)
                             << "[IO-PATTERN-EVICT-DIAG] io_pattern eviction "
                                "tenant="
                             << tenant.value() << " target=" << target.bytes
@@ -739,13 +743,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
                         size_t shown = 0;
                         for (const auto& key : target.keys) {
                             if (shown++ >= 3) break;
-                            LOG(WARNING)
+                            VLOG(1)
                                 << "[IO-PATTERN-EVICT-DIAG]   candidate key="
                                 << key;
                         }
                         ReportEvictedKeysAsTierRemovals(tenant, target.keys);
                     }
-                    LOG(WARNING)
+                    VLOG(1)
                         << "[IO-PATTERN-EVICT-DIAG] io_pattern eviction "
                            "summary plan_target="
                         << plan.target_bytes
@@ -808,9 +812,21 @@ MasterService::MasterService(const MasterServiceConfig& config)
                         object_id, /*record_candidate=*/false));
                 }},
         std::move(io_pattern_config));
-    MasterMetricManager::instance().set_io_pattern_runtime(io_pattern_runtime_);
-    io_pattern_cfm_service_ = std::make_shared<io_pattern::CfmService>(
-        io_pattern_runtime_);
+    if (config.io_pattern_enabled) {
+        MasterMetricManager::instance().set_io_pattern_runtime(
+            io_pattern_runtime_);
+        io_pattern_cfm_service_ =
+            std::make_shared<io_pattern::CfmService>(io_pattern_runtime_);
+    } else {
+        // --io_pattern_enabled=false: release the subsystem right away so every
+        // data-path `if (io_pattern_runtime_)` guard short-circuits (no
+        // RecordAccess, no ScheduleAdmission, no report-driven cycle) and the
+        // eviction thread falls back to the legacy BatchEvict(). The runtime is
+        // built above only so the handler wiring stays in one place; releasing
+        // it here also joins its workers, so nothing is left running. The
+        // /metrics endpoint then reports no io_pattern series at all.
+        io_pattern_runtime_.reset();
+    }
 
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
@@ -7440,8 +7456,6 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
-    io_pattern::AccessRecord io_access;
-    bool record_io_access = false;
     {
         // shard 读锁归因：MetadataAccessorRO 构造 = shard mutex 共享锁 +
         // tenant/metadata/processing 三次哈希查找。构造函数无法将锁与查找
@@ -7540,23 +7554,6 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
         resp = GetReplicaListResponse(std::move(replica_list),
                                       default_kv_lease_ttl_,
                                       metadata.object_checksum);
-        io_access.object = {object_id.tenant_id, key};
-        io_access.observed_at_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-                .count());
-        io_access.block_size = metadata.size;
-        // LOCAL_DISK is reported as its own tier: it is the only tier the store
-        // can promote from, and collapsing it into kL3NofSsd made local-disk and
-        // NoF-only objects indistinguishable to the policy.
-        io_access.tier = resp.replicas[0].is_memory_replica()
-                             ? io_pattern::CacheTier::kL1Host
-                             : (resp.replicas[0].is_local_disk_replica()
-                                    ? io_pattern::CacheTier::kLocalDisk
-                                    : io_pattern::CacheTier::kL3NofSsd);
-        io_access.operation = io_pattern::IoOperation::kGet;
-        io_access.is_hit = true;
-        record_io_access = true;
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -7569,19 +7566,18 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
         TryPushPromotionQueue(object_id);
         pt_promo.End(0);
     }
-    // Core 覆盖至 promotion 入队；RecordAccess 由 MASTER_IO_* 单独归因，
-    // 计入 Total（Total - Core - MASTER_IO_* = 未覆盖残差）。
+    // Core 覆盖至 promotion 入队。单 key Get 不再记录 io_pattern 访问（见下），
+    // 所以 Total - Core 的残差只剩 metrics 计数与响应构造；MASTER_IO_* 分段点
+    // 现在只对批量 Get 和 Put 路径有意义。
     pt_core.End(0);
-    // TODO(P99-diag): 临时禁用 get 路径 RecordAccess（内部 collector/
-    // observability/feedback_state 多把 mutex 是疑似锁竞争点），A/B 对比
-    // 定位完成后必须恢复——长期保留会使 io_pattern 丢失 get 侧访问统计
-    // 输入，驱逐/准入决策退化为无该输入。注意：batch（BatchGetReplicaListLocal）
-    // 与 put 路径的 RecordAccess 未禁用，A/B 测试需走单 key Get 路径才有效。
-    // if (record_io_access && io_pattern_runtime_) {
-    //     io_pattern_runtime_->RecordAccess(key, io_access);
-    // }
-    (void)record_io_access;
-    (void)io_access;
+    // Get-side RecordAccess is intentionally NOT recorded here. It used to be
+    // assembled and then dropped on the floor ("TODO(P99-diag) 临时禁用"), which
+    // paid a full AccessRecord construction (two std::string copies + a clock
+    // read) on the hottest path for no data at all. Re-adding it now would put
+    // the collector's global mutex back on single-key Get; that only becomes
+    // affordable once the collector is sharded and the snapshot is incremental
+    // (P1 in docs/analyze/io_pattern_latency_review.md). Batch get and Put keep
+    // feeding the collector in the meantime.
     pt_total.End(0);
     EnrichVSegmentLayouts(&resp);
     return resp;
@@ -8594,7 +8590,8 @@ auto MasterService::PutEndInternal(
     const UUID& client_id, const ObjectMeta& object_meta,
     const TenantId& tenant_id, ReplicaType replica_type,
     uint32_t write_batch_size, bool overwrite,
-    const std::string& operation_id)
+    const std::string& operation_id,
+    io_pattern::AccessRecord* io_access_out)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -8747,27 +8744,45 @@ auto MasterService::PutEndInternal(
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
     PublishKvStored(key, replica_type, metadata, object_id.tenant_id);
 
-    if (io_pattern_runtime_) {
-        io_pattern_runtime_->RecordAccess(
-            key, {.object = {object_id.tenant_id, key},
-                  .observed_at_ns = static_cast<uint64_t>(
-                      std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          std::chrono::steady_clock::now().time_since_epoch())
-                          .count()),
-                  .block_size = metadata.size,
-                  .tier = replica_type == ReplicaType::MEMORY
-                              ? io_pattern::CacheTier::kL1Host
-                              : (replica_type == ReplicaType::LOCAL_DISK
-                                     ? io_pattern::CacheTier::kLocalDisk
-                                     : io_pattern::CacheTier::kL3NofSsd),
-                  .operation = io_pattern::IoOperation::kPut,
-                  .is_hit = true,
-                  .write_batch_size = write_batch_size,
-                  .overwrite = overwrite});
-        if (replica_type != ReplicaType::MEMORY) {
-            io_pattern_runtime_->ScheduleAdmission(
-                {object_id.tenant_id, key}, io_pattern::CacheTier::kL1Host);
-        }
+    // Assemble the write-path observation while the authoritative metadata is in
+    // scope, but do NOT record it here: RecordAccess takes the collector's
+    // global mutex, and this function still holds the snapshot read lock and the
+    // shard write lock. Recording happens in the public entry points after
+    // PutEndInternal returns (RecordPutAccess), so a background collector
+    // snapshot cannot stall every other key in this shard.
+    //
+    // Skipped entirely when the subsystem is off, so --io_pattern_enabled=false
+    // costs the write path nothing at all (not even building the record).
+    if (io_access_out != nullptr && io_pattern_runtime_) {
+        // A memory replica is the landing tier only when it completed: an
+        // invalid memory handle leaves the copy unusable, and claiming kL1Host
+        // would also suppress the admission that could still promote this key.
+        const bool io_landed_in_memory =
+            replica_type == ReplicaType::MEMORY ||
+            (replica_type == ReplicaType::ALL && has_memory_replica &&
+             metadata.HasReplica([](const Replica& replica) {
+                 return replica.is_memory_replica() && replica.is_completed();
+             }));
+        *io_access_out = io_pattern::AccessRecord{
+            .object = {object_id.tenant_id, key},
+            .observed_at_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count()),
+            .block_size = metadata.size,
+            // ReplicaType::ALL is the normal client PutEnd. Report the tier the
+            // object actually landed on instead of falling through to the
+            // remote-SSD default, which made every normal Put claim it had no
+            // near-tier copy.
+            .tier = io_landed_in_memory
+                        ? io_pattern::CacheTier::kL1Host
+                        : (replica_type == ReplicaType::LOCAL_DISK
+                               ? io_pattern::CacheTier::kLocalDisk
+                               : io_pattern::CacheTier::kL3NofSsd),
+            .operation = io_pattern::IoOperation::kPut,
+            .is_hit = true,
+            .write_batch_size = write_batch_size,
+            .overwrite = overwrite};
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -9084,13 +9099,30 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     return {};
 }
 
+void MasterService::RecordPutAccess(const io_pattern::AccessRecord& access) {
+    if (!io_pattern_runtime_ || access.object.key.empty()) return;
+    io_pattern_runtime_->RecordAccess(access.object.key, access);
+    // A write can only be admitted through the promotion queue, and that
+    // primitive does nothing unless promotion-on-hit is enabled: with it off the
+    // handler returns UNAVAILABLE_IN_CURRENT_MODE, so enqueuing would make the
+    // admission worker burn a full collector snapshot per Put for no action.
+    if (promotion_on_hit_ && access.tier != io_pattern::CacheTier::kL1Host) {
+        io_pattern_runtime_->ScheduleAdmission(access.object,
+                                               io_pattern::CacheTier::kL1Host);
+    }
+}
+
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type,
                            const std::string& operation_id)
     -> tl::expected<void, ErrorCode> {
-    return PutEndInternal(client_id, object_meta, tenant_id, replica_type,
-                          /*write_batch_size=*/1, /*overwrite=*/false,
-                          operation_id);
+    io_pattern::AccessRecord io_access;
+    auto result =
+        PutEndInternal(client_id, object_meta, tenant_id, replica_type,
+                       /*write_batch_size=*/1, /*overwrite=*/false,
+                       operation_id, &io_access);
+    if (result) RecordPutAccess(io_access);
+    return result;
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
@@ -9108,11 +9140,14 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(object_metas.size());
     for (const auto& object_meta : object_metas) {
-        results.emplace_back(PutEndInternal(
+        io_pattern::AccessRecord io_access;
+        auto result = PutEndInternal(
             client_id, object_meta, tenant_id, replica_type,
             static_cast<uint32_t>(std::min<size_t>(
                 object_metas.size(), std::numeric_limits<uint32_t>::max())),
-            /*overwrite=*/false));
+            /*overwrite=*/false, /*operation_id=*/"", &io_access);
+        if (result) RecordPutAccess(io_access);
+        results.emplace_back(std::move(result));
     }
     return results;
 }
@@ -9532,9 +9567,13 @@ auto MasterService::UpsertEnd(const UUID& client_id,
                               ReplicaType replica_type,
                               const std::string& operation_id)
     -> tl::expected<void, ErrorCode> {
-    return PutEndInternal(client_id, object_meta, tenant_id, replica_type,
-                          /*write_batch_size=*/1, /*overwrite=*/true,
-                          operation_id);
+    io_pattern::AccessRecord io_access;
+    auto result =
+        PutEndInternal(client_id, object_meta, tenant_id, replica_type,
+                       /*write_batch_size=*/1, /*overwrite=*/true,
+                       operation_id, &io_access);
+    if (result) RecordPutAccess(io_access);
+    return result;
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
@@ -9597,9 +9636,13 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
     const auto batch_size = static_cast<uint32_t>(std::min<size_t>(
         object_metas.size(), std::numeric_limits<uint32_t>::max()));
     for (const auto& object_meta : object_metas) {
-        results.emplace_back(PutEndInternal(client_id, object_meta, tenant_id,
-                                            ReplicaType::ALL, batch_size,
-                                            /*overwrite=*/true));
+        io_pattern::AccessRecord io_access;
+        auto result =
+            PutEndInternal(client_id, object_meta, tenant_id, ReplicaType::ALL,
+                           batch_size, /*overwrite=*/true,
+                           /*operation_id=*/"", &io_access);
+        if (result) RecordPutAccess(io_access);
+        results.emplace_back(std::move(result));
     }
     return results;
 }
@@ -13647,7 +13690,9 @@ MasterService::EvictTenantMemoryForQuota(
             }
         }
         if (candidate_keys) {
-            LOG(WARNING)
+            // Per-tenant, per-cycle scan diagnostics: verbose only. The failure
+            // paths below stay at WARNING because they are rare and actionable.
+            VLOG(1)
                 << "[IO-PATTERN-EVICT-DIAG] quota pass candidate scan "
                    "tenant="
                 << normalized_tenant.value()

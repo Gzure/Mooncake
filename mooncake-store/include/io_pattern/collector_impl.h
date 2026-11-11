@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -75,7 +76,10 @@ class IoPatternCollectorImpl final : public IoPatternCollector {
     mutable std::mutex mutex_;
     Config config_;
     std::shared_ptr<IoPatternReporter> reporter_;
-    uint64_t dropped_{0};
+    // Relaxed atomic: the data path samples this twice per access to attribute
+    // drops, so it must not take the collector mutex. Making it an atomic keeps
+    // one access from acquiring the same global lock three times.
+    std::atomic<uint64_t> dropped_{0};
     bool degraded_{false};
     std::unordered_map<ObjectRef, KeyMetrics, ObjectRefHash> key_metrics_;
     std::unordered_map<ObjectRef, std::deque<AccessWindowBucket>, ObjectRefHash>

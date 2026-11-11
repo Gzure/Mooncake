@@ -88,27 +88,42 @@ void IoPatternCollectorImpl::RecordAccess(const std::string& key,
                                           const AccessRecord& record) {
     std::lock_guard lock(mutex_);
     if (reporter_ && !reporter_->EnqueueAccess(record)) ++dropped_;
-    ObjectRef object = record.object;
-    if (!key.empty()) object.key = key;
-    if (!key_metrics_.contains(object) && config_.max_total_keys != 0 &&
-        key_metrics_.size() >= config_.max_total_keys) {
-        degraded_ = true;
-        ++dropped_;
-        return;
+    // Callers pass the same key twice: RecordAccess(key, record) where
+    // record.object.key is already key. Only build a patched copy when they
+    // differ, so the common path does no string copy at all.
+    const ObjectRef* object = &record.object;
+    ObjectRef patched_object;
+    if (!key.empty() && record.object.key != key) {
+        patched_object = record.object;
+        patched_object.key = key;
+        object = &patched_object;
     }
-    if (!key_metrics_.contains(object) && config_.max_keys_per_tenant != 0 &&
-        tenant_key_counts_[object.tenant_id] >= config_.max_keys_per_tenant) {
-        ++dropped_;
-        return;
+    // One lookup instead of four: the previous code probed key_metrics_ with
+    // contains() up to three times plus operator[] before every access.
+    auto key_it = key_metrics_.find(*object);
+    if (key_it == key_metrics_.end()) {
+        if (config_.max_total_keys != 0 &&
+            key_metrics_.size() >= config_.max_total_keys) {
+            degraded_ = true;
+            ++dropped_;
+            return;
+        }
+        if (config_.max_keys_per_tenant != 0 &&
+            tenant_key_counts_[object->tenant_id] >=
+                config_.max_keys_per_tenant) {
+            ++dropped_;
+            return;
+        }
+        ++tenant_key_counts_[object->tenant_id];
+        key_it = key_metrics_.emplace(*object, KeyMetrics{}).first;
     }
-    if (!key_metrics_.contains(object)) ++tenant_key_counts_[object.tenant_id];
-    auto& value = key_metrics_[object];
-    value.object = object;
+    auto& value = key_it->second;
+    value.object = *object;
     const uint64_t observed_at_ns =
         record.observed_at_ns == 0
             ? (config_.now_ns ? config_.now_ns() : NowNs())
             : record.observed_at_ns;
-    auto& window = access_windows_[object];
+    auto& window = access_windows_[*object];
     const uint64_t bucket_ns = std::max<uint64_t>(1, config_.access_bucket_ns);
     const uint64_t bucket_timestamp =
         observed_at_ns - (observed_at_ns % bucket_ns);
@@ -159,7 +174,7 @@ void IoPatternCollectorImpl::RecordAccess(const std::string& key,
         value.write_object_size = std::max(value.write_object_size,
                                            record.block_size);
     }
-    ApplyAccessWindow(object, observed_at_ns, value);
+    ApplyAccessWindow(*object, observed_at_ns, value);
 }
 
 void IoPatternCollectorImpl::RecordStorageMetric(const StorageMetric& metric) {
@@ -283,8 +298,7 @@ IoPatternSnapshot IoPatternCollectorImpl::GetSnapshot() const {
 }
 
 uint64_t IoPatternCollectorImpl::dropped() const {
-    std::lock_guard lock(mutex_);
-    return dropped_;
+    return dropped_.load(std::memory_order_relaxed);
 }
 
 bool IoPatternCollectorImpl::degraded() const {

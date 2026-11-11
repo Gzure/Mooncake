@@ -8,7 +8,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <mutex>
+#include <ostream>
 #include <random>
+#include <streambuf>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,12 +43,16 @@ uint64_t SteadyClockNs() {
 
 double ParseHiFreqLogSampleRate() {
     const char* value = std::getenv("MC_HIFREQ_LOG_SAMPLE_RATE");
-    if (value == nullptr || *value == '\0')
-        return 1.0;  // default: full sampling
+    // Default matches the documented intent in mooncake_logging.h: sample one
+    // request in ten. Full sampling (1.0) at INFO level puts a log line on the
+    // server's RPC path for every request, which costs tens of microseconds per
+    // request once the sink is synchronous (measured on the URMA benchmark:
+    // 9.14us avg at WARN vs 55.89us with INFO server logs).
+    if (value == nullptr || *value == '\0') return 0.1;
     errno = 0;
     char* end = nullptr;
     double rate = std::strtod(value, &end);
-    if (end == value || errno != 0) return 1.0;  // non-numeric / overflow
+    if (end == value || errno != 0) return 0.1;  // non-numeric / overflow
     if (rate < 0.0) return 0.0;
     if (rate > 1.0) return 1.0;
     return rate;
@@ -366,10 +372,18 @@ AsyncLogMessage::AsyncLogMessage(const char* file, int line,
       line_(line),
       severity_(severity),
       enabled_(enabled),
-      trace_id_(CurrentTraceId()) {}
+      trace_id_(CurrentTraceId()) {
+    // Do not build the string stream for a message that cannot be emitted.
+    if (enabled_) stream_.emplace();
+}
+
+std::ostream& AsyncLogMessage::stream() {
+    if (enabled_ && stream_) return *stream_;
+    return NullLogStream();
+}
 
 AsyncLogMessage::~AsyncLogMessage() {
-    if (!enabled_) return;
+    if (!enabled_ || !stream_) return;
     if (severity_ == google::FATAL) {
         google::LogMessage log_message(file_, line_, severity_);
         auto& output = log_message.stream();
@@ -378,14 +392,25 @@ AsyncLogMessage::~AsyncLogMessage() {
         } else {
             output << "trace_id[none] ";
         }
-        output << stream_.str();
+        output << stream_->str();
         return;
     }
     AsyncLogQueue::Instance().Enqueue(
-        LogEntry{file_, line_, severity_, trace_id_, stream_.str()});
+        LogEntry{file_, line_, severity_, trace_id_, stream_->str()});
 }
 
-std::ostream& AsyncLogMessage::stream() { return stream_; }
+std::ostream& NullLogStream() {
+    class NullBuf final : public std::streambuf {
+       protected:
+        int overflow(int c) override { return c; }
+    };
+    // thread_local, not static: std::ostream is not thread-safe, and every
+    // suppressed MC_LOG on every RPC thread formats into this sink. A shared
+    // instance would be a data race on the stream's formatting state.
+    thread_local NullBuf buf;
+    thread_local std::ostream stream(&buf);
+    return stream;
+}
 
 void FlushAsyncLogs() { AsyncLogQueue::Instance().Flush(); }
 

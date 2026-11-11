@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <sstream>
 
 #include <glog/logging.h>
@@ -53,8 +54,17 @@ class AsyncLogMessage {
     google::LogSeverity severity_;
     bool enabled_;
     uint64_t trace_id_;
-    std::ostringstream stream_;
+    // Only materialised when the severity passes the threshold, so a disabled
+    // MC_LOG/MC_VLOG does no formatting, no allocation and no string copy. The
+    // old by-value member formatted every suppressed call too, which made an
+    // INFO-gated fast path as expensive as the logging itself (see R4 in
+    // docs/analyze/urma_poll_latency_diagnosis.md).
+    std::optional<std::ostringstream> stream_;
 };
+
+// Sink returned by AsyncLogMessage::stream() when the message is suppressed.
+// Writes are discarded; it exists so the caller's `<<` chain still compiles.
+std::ostream& NullLogStream();
 
 void FlushAsyncLogs();
 
